@@ -20,7 +20,7 @@ const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
 const TEXT_SIZE: f32 = 13.0;
 
-actions!(review, [NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, Quit]);
+actions!(review, [NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit]);
 
 fn main() {
     let arg = match std::env::args().nth(1) {
@@ -62,6 +62,7 @@ fn main() {
                 KeyBinding::new("p", PrevHunk, Some("ReviewApp")),
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
+                KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("cmd-q", Quit, None),
             ]);
             cx.on_action(|_: &Quit, cx| cx.quit());
@@ -77,7 +78,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| ReviewApp::new(meta, &diff, cx));
+                    let view = cx.new(|cx| ReviewApp::new(meta, diff, cx));
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -92,11 +93,25 @@ fn die<E: std::fmt::Display, T>(err: E) -> T {
     std::process::exit(1);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LineKind {
     Context,
     Added,
     Removed,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Unified,
+    Split,
+}
+
+/// One side of a split row: line number, kind, text, and word-level highlights.
+struct Cell {
+    no: u32,
+    kind: LineKind,
+    text: SharedString,
+    intra: Vec<Range<usize>>,
 }
 
 enum Row {
@@ -119,10 +134,245 @@ enum Row {
         text: SharedString,
         intra: Vec<Range<usize>>,
     },
+    SplitLine {
+        left: Option<Cell>,
+        right: Option<Cell>,
+    },
+}
+
+/// Flatten the diff into display rows plus the row indices of file headers and
+/// hunk headers. Split mode pairs removed/added runs positionally into
+/// two-cell rows; unequal runs leave one-sided rows.
+fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
+    let mut rows = Vec::new();
+    let mut file_rows = Vec::new();
+    let mut hunk_rows = Vec::new();
+
+    for file in &diff.files {
+        if !rows.is_empty() {
+            rows.push(Row::Spacer);
+        }
+        file_rows.push(rows.len());
+        rows.push(Row::FileHeader {
+            path: file.display_path().to_string().into(),
+            old_path: match file.status {
+                FileStatus::Renamed => file.old_path.clone().map(Into::into),
+                _ => None,
+            },
+            status: file.status,
+            additions: file.additions,
+            deletions: file.deletions,
+        });
+        if file.status == FileStatus::Binary {
+            rows.push(Row::Binary);
+            continue;
+        }
+        for hunk in &file.hunks {
+            hunk_rows.push(rows.len());
+            let mut label = format!(
+                "@@ -{},{} +{},{} @@",
+                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+            );
+            if !hunk.section.is_empty() {
+                label.push(' ');
+                label.push_str(&hunk.section);
+            }
+            rows.push(Row::HunkHeader {
+                label: label.into(),
+            });
+            match mode {
+                ViewMode::Unified => {
+                    for row in &hunk.rows {
+                        rows.push(match row {
+                            DiffRow::Context {
+                                old_no,
+                                new_no,
+                                text,
+                            } => Row::Line {
+                                old_no: Some(*old_no),
+                                new_no: Some(*new_no),
+                                kind: LineKind::Context,
+                                text: text.clone().into(),
+                                intra: Vec::new(),
+                            },
+                            DiffRow::Added {
+                                new_no,
+                                text,
+                                intra,
+                            } => Row::Line {
+                                old_no: None,
+                                new_no: Some(*new_no),
+                                kind: LineKind::Added,
+                                text: text.clone().into(),
+                                intra: intra.clone(),
+                            },
+                            DiffRow::Removed {
+                                old_no,
+                                text,
+                                intra,
+                            } => Row::Line {
+                                old_no: Some(*old_no),
+                                new_no: None,
+                                kind: LineKind::Removed,
+                                text: text.clone().into(),
+                                intra: intra.clone(),
+                            },
+                        });
+                    }
+                }
+                ViewMode::Split => {
+                    // Same run-scan shape as diff-core's compute_intra_line:
+                    // a run of Removed immediately followed by a run of Added
+                    // pairs positionally; the excess (and lone runs) render
+                    // one-sided.
+                    let hrows = &hunk.rows;
+                    let mut i = 0;
+                    while i < hrows.len() {
+                        match &hrows[i] {
+                            DiffRow::Context {
+                                old_no,
+                                new_no,
+                                text,
+                            } => {
+                                let text: SharedString = text.clone().into();
+                                rows.push(Row::SplitLine {
+                                    left: Some(Cell {
+                                        no: *old_no,
+                                        kind: LineKind::Context,
+                                        text: text.clone(),
+                                        intra: Vec::new(),
+                                    }),
+                                    right: Some(Cell {
+                                        no: *new_no,
+                                        kind: LineKind::Context,
+                                        text,
+                                        intra: Vec::new(),
+                                    }),
+                                });
+                                i += 1;
+                            }
+                            DiffRow::Added {
+                                new_no,
+                                text,
+                                intra,
+                            } => {
+                                // Added run with no preceding Removed run.
+                                rows.push(Row::SplitLine {
+                                    left: None,
+                                    right: Some(Cell {
+                                        no: *new_no,
+                                        kind: LineKind::Added,
+                                        text: text.clone().into(),
+                                        intra: intra.clone(),
+                                    }),
+                                });
+                                i += 1;
+                            }
+                            DiffRow::Removed { .. } => {
+                                let start = i;
+                                while i < hrows.len()
+                                    && matches!(hrows[i], DiffRow::Removed { .. })
+                                {
+                                    i += 1;
+                                }
+                                let mid = i;
+                                while i < hrows.len() && matches!(hrows[i], DiffRow::Added { .. })
+                                {
+                                    i += 1;
+                                }
+                                let (removed, added) = (mid - start, i - mid);
+                                for pair in 0..removed.max(added) {
+                                    let left = (pair < removed).then(|| {
+                                        match &hrows[start + pair] {
+                                            DiffRow::Removed {
+                                                old_no,
+                                                text,
+                                                intra,
+                                            } => Cell {
+                                                no: *old_no,
+                                                kind: LineKind::Removed,
+                                                text: text.clone().into(),
+                                                intra: intra.clone(),
+                                            },
+                                            _ => unreachable!(),
+                                        }
+                                    });
+                                    let right = (pair < added).then(|| {
+                                        match &hrows[mid + pair] {
+                                            DiffRow::Added {
+                                                new_no,
+                                                text,
+                                                intra,
+                                            } => Cell {
+                                                no: *new_no,
+                                                kind: LineKind::Added,
+                                                text: text.clone().into(),
+                                                intra: intra.clone(),
+                                            },
+                                            _ => unreachable!(),
+                                        }
+                                    });
+                                    rows.push(Row::SplitLine { left, right });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    (rows, file_rows, hunk_rows)
+}
+
+/// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
+fn kind_style(kind: LineKind) -> (Option<gpui::Rgba>, Option<gpui::Rgba>, &'static str, gpui::Rgba) {
+    match kind {
+        LineKind::Context => (None, None, "", theme::overlay0()),
+        LineKind::Added => (
+            Some(theme::added_row_bg()),
+            Some(theme::added_word_bg()),
+            "+",
+            theme::green(),
+        ),
+        LineKind::Removed => (
+            Some(theme::removed_row_bg()),
+            Some(theme::removed_word_bg()),
+            "−",
+            theme::red(),
+        ),
+    }
+}
+
+/// Line text with word-level highlight ranges, shared by unified rows and
+/// split cells.
+fn line_content(
+    text: &SharedString,
+    intra: &[Range<usize>],
+    word_bg: Option<gpui::Rgba>,
+) -> gpui::AnyElement {
+    if intra.is_empty() {
+        div().child(text.clone()).into_any_element()
+    } else {
+        let highlights = intra.iter().map(|range| {
+            (
+                range.clone(),
+                HighlightStyle {
+                    background_color: Some(word_bg.unwrap().into()),
+                    ..Default::default()
+                },
+            )
+        });
+        StyledText::new(text.clone())
+            .with_highlights(highlights)
+            .into_any_element()
+    }
 }
 
 struct ReviewApp {
     meta: gh::PrMeta,
+    diff: PrDiff,
+    mode: ViewMode,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -132,85 +382,13 @@ struct ReviewApp {
 }
 
 impl ReviewApp {
-    fn new(meta: gh::PrMeta, diff: &PrDiff, cx: &mut Context<Self>) -> Self {
-        let mut rows = Vec::new();
-        let mut file_rows = Vec::new();
-        let mut hunk_rows = Vec::new();
-
-        for file in &diff.files {
-            if !rows.is_empty() {
-                rows.push(Row::Spacer);
-            }
-            file_rows.push(rows.len());
-            rows.push(Row::FileHeader {
-                path: file.display_path().to_string().into(),
-                old_path: match file.status {
-                    FileStatus::Renamed => file.old_path.clone().map(Into::into),
-                    _ => None,
-                },
-                status: file.status,
-                additions: file.additions,
-                deletions: file.deletions,
-            });
-            if file.status == FileStatus::Binary {
-                rows.push(Row::Binary);
-                continue;
-            }
-            for hunk in &file.hunks {
-                hunk_rows.push(rows.len());
-                let mut label = format!(
-                    "@@ -{},{} +{},{} @@",
-                    hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
-                );
-                if !hunk.section.is_empty() {
-                    label.push(' ');
-                    label.push_str(&hunk.section);
-                }
-                rows.push(Row::HunkHeader {
-                    label: label.into(),
-                });
-                for row in &hunk.rows {
-                    rows.push(match row {
-                        DiffRow::Context {
-                            old_no,
-                            new_no,
-                            text,
-                        } => Row::Line {
-                            old_no: Some(*old_no),
-                            new_no: Some(*new_no),
-                            kind: LineKind::Context,
-                            text: text.clone().into(),
-                            intra: Vec::new(),
-                        },
-                        DiffRow::Added {
-                            new_no,
-                            text,
-                            intra,
-                        } => Row::Line {
-                            old_no: None,
-                            new_no: Some(*new_no),
-                            kind: LineKind::Added,
-                            text: text.clone().into(),
-                            intra: intra.clone(),
-                        },
-                        DiffRow::Removed {
-                            old_no,
-                            text,
-                            intra,
-                        } => Row::Line {
-                            old_no: Some(*old_no),
-                            new_no: None,
-                            kind: LineKind::Removed,
-                            text: text.clone().into(),
-                            intra: intra.clone(),
-                        },
-                    });
-                }
-            }
-        }
-
+    fn new(meta: gh::PrMeta, diff: PrDiff, cx: &mut Context<Self>) -> Self {
+        let mode = ViewMode::Unified;
+        let (rows, file_rows, hunk_rows) = build_rows(&diff, mode);
         Self {
             meta,
+            diff,
+            mode,
             rows,
             file_rows,
             hunk_rows,
@@ -218,6 +396,23 @@ impl ReviewApp {
             scroll: UniformListScrollHandle::new(),
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    fn toggle_view(&mut self, cx: &mut Context<Self>) {
+        // Best-effort position preservation: stay on the same file.
+        let file_pos = self.file_rows.iter().rposition(|&ix| ix <= self.cursor);
+        self.mode = match self.mode {
+            ViewMode::Unified => ViewMode::Split,
+            ViewMode::Split => ViewMode::Unified,
+        };
+        let (rows, file_rows, hunk_rows) = build_rows(&self.diff, self.mode);
+        self.rows = rows;
+        self.file_rows = file_rows;
+        self.hunk_rows = hunk_rows;
+        let target = file_pos
+            .and_then(|pos| self.file_rows.get(pos).copied())
+            .unwrap_or(0);
+        self.jump(target, cx);
     }
 
     fn jump(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -320,21 +515,7 @@ impl ReviewApp {
                 text,
                 intra,
             } => {
-                let (row_bg, word_bg, marker, marker_color) = match kind {
-                    LineKind::Context => (None, None, "", theme::overlay0()),
-                    LineKind::Added => (
-                        Some(theme::added_row_bg()),
-                        Some(theme::added_word_bg()),
-                        "+",
-                        theme::green(),
-                    ),
-                    LineKind::Removed => (
-                        Some(theme::removed_row_bg()),
-                        Some(theme::removed_word_bg()),
-                        "−",
-                        theme::red(),
-                    ),
-                };
+                let (row_bg, word_bg, marker, marker_color) = kind_style(*kind);
                 let number = |no: Option<u32>| {
                     div()
                         .w(px(44.))
@@ -345,22 +526,6 @@ impl ReviewApp {
                         .child(SharedString::from(
                             no.map(|no| no.to_string()).unwrap_or_default(),
                         ))
-                };
-                let content: gpui::AnyElement = if intra.is_empty() {
-                    div().child(text.clone()).into_any_element()
-                } else {
-                    let highlights = intra.iter().map(|range| {
-                        (
-                            range.clone(),
-                            HighlightStyle {
-                                background_color: Some(word_bg.unwrap().into()),
-                                ..Default::default()
-                            },
-                        )
-                    });
-                    StyledText::new(text.clone())
-                        .with_highlights(highlights)
-                        .into_any_element()
                 };
                 let mut line = div().h(row_height).flex().items_center();
                 if let Some(bg) = row_bg {
@@ -377,7 +542,59 @@ impl ReviewApp {
                             .text_color(marker_color)
                             .child(SharedString::from(marker)),
                     )
-                    .child(div().whitespace_nowrap().child(content))
+                    .child(div().whitespace_nowrap().child(line_content(text, intra, word_bg)))
+                    .into_any_element()
+            }
+            Row::SplitLine { left, right } => {
+                let cell = |cell: &Option<Cell>| {
+                    let base = div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .h_full()
+                        .flex()
+                        .items_center();
+                    let Some(cell) = cell else {
+                        return base.bg(theme::mantle());
+                    };
+                    let (row_bg, word_bg, marker, marker_color) = kind_style(cell.kind);
+                    let mut side = base;
+                    if let Some(bg) = row_bg {
+                        side = side.bg(bg);
+                    }
+                    side.child(
+                        div()
+                            .w(px(44.))
+                            .flex_shrink_0()
+                            .text_color(theme::overlay0())
+                            .flex()
+                            .justify_end()
+                            .child(SharedString::from(cell.no.to_string())),
+                    )
+                    .child(
+                        div()
+                            .w(px(28.))
+                            .flex_shrink_0()
+                            .flex()
+                            .justify_center()
+                            .text_color(marker_color)
+                            .child(SharedString::from(marker)),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .child(line_content(&cell.text, &cell.intra, word_bg)),
+                    )
+                };
+                div()
+                    .h(row_height)
+                    .flex()
+                    .child(cell(left))
+                    .child(
+                        cell(right)
+                            .border_l_1()
+                            .border_color(theme::surface0()),
+                    )
                     .into_any_element()
             }
         }
@@ -480,6 +697,7 @@ impl ReviewApp {
             .text_size(px(12.))
             .child(hint(&["]", "["], "files"))
             .child(hint(&["n", "p"], "hunks"))
+            .child(hint(&["v"], "unified/split"))
             .child(hint(&["home", "end"], "top/bottom"))
     }
 }
@@ -516,6 +734,7 @@ impl Render for ReviewApp {
                 let last = this.rows.len().saturating_sub(1);
                 this.jump(last, cx)
             }))
+            .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
             .child(self.render_titlebar())
             .child(
                 div()
@@ -531,13 +750,206 @@ impl Render for ReviewApp {
                             range.map(|ix| this.render_row(ix)).collect()
                         })
                         .track_scroll(self.scroll.clone())
-                        .with_horizontal_sizing_behavior(
-                            ListHorizontalSizingBehavior::Unconstrained,
-                        )
+                        .with_horizontal_sizing_behavior(match self.mode {
+                            ViewMode::Unified => ListHorizontalSizingBehavior::Unconstrained,
+                            ViewMode::Split => ListHorizontalSizingBehavior::FitList,
+                        })
                         .h_full(),
                     )
                     .child(Scrollbar::new(&self.scroll)),
             )
             .child(self.render_footer())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use diff_core::{FileDiff, Hunk};
+
+    fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
+        DiffRow::Context {
+            old_no,
+            new_no,
+            text: text.to_string(),
+        }
+    }
+
+    fn add(new_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
+        DiffRow::Added {
+            new_no,
+            text: text.to_string(),
+            intra,
+        }
+    }
+
+    fn rem(old_no: u32, text: &str, intra: Vec<Range<usize>>) -> DiffRow {
+        DiffRow::Removed {
+            old_no,
+            text: text.to_string(),
+            intra,
+        }
+    }
+
+    fn hunk(old_start: u32, new_start: u32, rows: Vec<DiffRow>) -> Hunk {
+        Hunk {
+            old_start,
+            old_count: 0,
+            new_start,
+            new_count: 0,
+            section: String::new(),
+            rows,
+        }
+    }
+
+    fn sample_diff() -> PrDiff {
+        PrDiff {
+            files: vec![
+                FileDiff {
+                    old_path: Some("a.rs".into()),
+                    new_path: Some("a.rs".into()),
+                    status: FileStatus::Modified,
+                    hunks: vec![
+                        // Equal-count modified run, flanked by context.
+                        hunk(
+                            1,
+                            1,
+                            vec![
+                                ctx(1, 1, "ctx"),
+                                rem(2, "old1", vec![0..3]),
+                                rem(3, "old2", Vec::new()),
+                                add(2, "new1", vec![0..3]),
+                                add(3, "new2", Vec::new()),
+                                ctx(4, 4, "tail"),
+                            ],
+                        ),
+                        // Unequal run (2 removed, 1 added) + a lone added run.
+                        hunk(
+                            10,
+                            10,
+                            vec![
+                                rem(10, "r1", Vec::new()),
+                                rem(11, "r2", Vec::new()),
+                                add(10, "a1", Vec::new()),
+                                ctx(12, 11, "c"),
+                                add(12, "lone", Vec::new()),
+                            ],
+                        ),
+                    ],
+                    additions: 4,
+                    deletions: 4,
+                },
+                FileDiff {
+                    old_path: Some("b.png".into()),
+                    new_path: Some("b.png".into()),
+                    status: FileStatus::Binary,
+                    hunks: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                },
+            ],
+        }
+    }
+
+    fn cell(cell: &Option<Cell>) -> (u32, LineKind, &str, &[Range<usize>]) {
+        let cell = cell.as_ref().expect("expected a cell");
+        (cell.no, cell.kind, cell.text.as_ref(), &cell.intra)
+    }
+
+    #[test]
+    fn split_context_fills_both_cells() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split);
+        // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
+        match &rows[2] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (1, LineKind::Context, "ctx", &[][..]));
+                assert_eq!(cell(right), (1, LineKind::Context, "ctx", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn split_pairs_equal_runs_positionally() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split);
+        match &rows[3] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
+                assert_eq!(cell(right), (2, LineKind::Added, "new1", &[0..3][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        match &rows[4] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (3, LineKind::Removed, "old2", &[][..]));
+                assert_eq!(cell(right), (3, LineKind::Added, "new2", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        // Equal run + 2 context rows: 4 split lines for a 6-row hunk.
+        match &rows[5] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left).2, "tail");
+                assert_eq!(cell(right).2, "tail");
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn split_unequal_and_lone_runs_are_one_sided() {
+        let (rows, _, hunk_rows) = build_rows(&sample_diff(), ViewMode::Split);
+        let h2 = hunk_rows[1];
+        // 2 removed / 1 added: first row paired, second left-only.
+        match &rows[h2 + 1] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (10, LineKind::Removed, "r1", &[][..]));
+                assert_eq!(cell(right), (10, LineKind::Added, "a1", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+        match &rows[h2 + 2] {
+            Row::SplitLine { left, right } => {
+                assert_eq!(cell(left), (11, LineKind::Removed, "r2", &[][..]));
+                assert!(right.is_none());
+            }
+            _ => panic!("expected split line"),
+        }
+        // Lone added run after context: right-only.
+        match &rows[h2 + 4] {
+            Row::SplitLine { left, right } => {
+                assert!(left.is_none());
+                assert_eq!(cell(right), (12, LineKind::Added, "lone", &[][..]));
+            }
+            _ => panic!("expected split line"),
+        }
+    }
+
+    #[test]
+    fn header_indices_are_correct_in_both_modes() {
+        let diff = sample_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode);
+            assert_eq!(file_rows.len(), 2);
+            assert_eq!(hunk_rows.len(), 2);
+            for &ix in &file_rows {
+                assert!(matches!(rows[ix], Row::FileHeader { .. }));
+            }
+            for &ix in &hunk_rows {
+                assert!(matches!(rows[ix], Row::HunkHeader { .. }));
+            }
+            // Binary file: header immediately followed by the binary row.
+            assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
+        }
+        // Unified emits one row per diff row; split collapses the equal run.
+        let (unified, _, _) = build_rows(&diff, ViewMode::Unified);
+        let (split, _, _) = build_rows(&diff, ViewMode::Split);
+        let unified_lines = unified.iter().filter(|r| matches!(r, Row::Line { .. })).count();
+        let split_lines = split
+            .iter()
+            .filter(|r| matches!(r, Row::SplitLine { .. }))
+            .count();
+        assert_eq!(unified_lines, 11);
+        assert_eq!(split_lines, 8); // 4 (hunk 1) + 4 (hunk 2)
     }
 }
