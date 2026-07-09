@@ -383,7 +383,7 @@ struct ReviewApp {
 
 impl ReviewApp {
     fn new(meta: gh::PrMeta, diff: PrDiff, cx: &mut Context<Self>) -> Self {
-        let mode = ViewMode::Unified;
+        let mode = ViewMode::Split;
         let (rows, file_rows, hunk_rows) = build_rows(&diff, mode);
         Self {
             meta,
@@ -454,6 +454,7 @@ impl ReviewApp {
                 let status: Hsla = status_color.into();
                 let mut header = div()
                     .h(row_height)
+                    .w_full()
                     .flex()
                     .items_center()
                     .gap_3()
@@ -493,6 +494,7 @@ impl ReviewApp {
             }
             Row::HunkHeader { label } => div()
                 .h(row_height)
+                .w_full()
                 .flex()
                 .items_center()
                 .px_3()
@@ -586,8 +588,12 @@ impl ReviewApp {
                             .child(line_content(&cell.text, &cell.intra, word_bg)),
                     )
                 };
+                // w_full is load-bearing: without a definite row width the row
+                // sizes to fit-content and the flex_1 halves collapse to their
+                // text width, putting the divider at a different x every row.
                 div()
                     .h(row_height)
+                    .w_full()
                     .flex()
                     .child(cell(left))
                     .child(
