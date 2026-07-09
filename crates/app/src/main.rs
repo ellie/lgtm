@@ -106,12 +106,14 @@ enum ViewMode {
     Split,
 }
 
-/// One side of a split row: line number, kind, text, and word-level highlights.
+/// One side of a split row: line number, kind, text, word-level highlights,
+/// and tree-sitter token spans.
 struct Cell {
     no: u32,
     kind: LineKind,
     text: SharedString,
     intra: Vec<Range<usize>>,
+    syntax: Vec<(Range<usize>, syntax::Token)>,
 }
 
 enum Row {
@@ -133,11 +135,85 @@ enum Row {
         kind: LineKind,
         text: SharedString,
         intra: Vec<Range<usize>>,
+        syntax: Vec<(Range<usize>, syntax::Token)>,
     },
     SplitLine {
         left: Option<Cell>,
         right: Option<Cell>,
     },
+}
+
+/// Guardrails: hunk sides bigger than this render without syntax highlighting.
+const MAX_HUNK_SOURCE_BYTES: usize = 100 * 1024;
+/// Individual lines longer than this stay plain even in a highlighted hunk.
+const MAX_SYNTAX_LINE_BYTES: usize = 4096;
+
+/// Patch-only highlighting: we have no full files, so highlight each hunk's
+/// text standalone, per side — old_source is context+removed lines, new_source
+/// is context+added — and hand each row its side's line spans (Context and
+/// Added from new, Removed from old). Degraded (no cross-hunk parser state)
+/// but visually fine. Returns one span list per hunk row, index-aligned.
+fn hunk_syntax(
+    lang: Option<&'static syntax::Language>,
+    rows: &[DiffRow],
+) -> Vec<Vec<(Range<usize>, syntax::Token)>> {
+    let Some(lang) = lang else {
+        return vec![Vec::new(); rows.len()];
+    };
+    let mut old_source = String::new();
+    let mut new_source = String::new();
+    // Per row: (takes spans from the old side, line index within that side).
+    let mut side_lines = Vec::with_capacity(rows.len());
+    let (mut old_line, mut new_line) = (0usize, 0usize);
+    for row in rows {
+        match row {
+            DiffRow::Context { text, .. } => {
+                old_source.push_str(text);
+                old_source.push('\n');
+                old_line += 1;
+                new_source.push_str(text);
+                new_source.push('\n');
+                side_lines.push((false, new_line));
+                new_line += 1;
+            }
+            DiffRow::Added { text, .. } => {
+                new_source.push_str(text);
+                new_source.push('\n');
+                side_lines.push((false, new_line));
+                new_line += 1;
+            }
+            DiffRow::Removed { text, .. } => {
+                old_source.push_str(text);
+                old_source.push('\n');
+                side_lines.push((true, old_line));
+                old_line += 1;
+            }
+        }
+    }
+    let highlight = |source: &str| {
+        if source.is_empty() || source.len() > MAX_HUNK_SOURCE_BYTES {
+            Vec::new()
+        } else {
+            syntax::highlight_lines(lang, source)
+        }
+    };
+    let old_spans = highlight(&old_source);
+    let new_spans = highlight(&new_source);
+    rows.iter()
+        .zip(side_lines)
+        .map(|(row, (from_old, line))| {
+            let text = match row {
+                DiffRow::Context { text, .. }
+                | DiffRow::Added { text, .. }
+                | DiffRow::Removed { text, .. } => text,
+            };
+            if text.len() > MAX_SYNTAX_LINE_BYTES {
+                return Vec::new();
+            }
+            let side = if from_old { &old_spans } else { &new_spans };
+            side.get(line).cloned().unwrap_or_default()
+        })
+        .collect()
 }
 
 /// Flatten the diff into display rows plus the row indices of file headers and
@@ -167,7 +243,9 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
             rows.push(Row::Binary);
             continue;
         }
+        let lang = syntax::language_for_path(file.display_path());
         for hunk in &file.hunks {
+            let syntax_spans = hunk_syntax(lang, &hunk.rows);
             hunk_rows.push(rows.len());
             let mut label = format!(
                 "@@ -{},{} +{},{} @@",
@@ -182,7 +260,8 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
             });
             match mode {
                 ViewMode::Unified => {
-                    for row in &hunk.rows {
+                    for (ix, row) in hunk.rows.iter().enumerate() {
+                        let syntax = syntax_spans[ix].clone();
                         rows.push(match row {
                             DiffRow::Context {
                                 old_no,
@@ -194,6 +273,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                 kind: LineKind::Context,
                                 text: text.clone().into(),
                                 intra: Vec::new(),
+                                syntax,
                             },
                             DiffRow::Added {
                                 new_no,
@@ -205,6 +285,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                 kind: LineKind::Added,
                                 text: text.clone().into(),
                                 intra: intra.clone(),
+                                syntax,
                             },
                             DiffRow::Removed {
                                 old_no,
@@ -216,6 +297,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                 kind: LineKind::Removed,
                                 text: text.clone().into(),
                                 intra: intra.clone(),
+                                syntax,
                             },
                         });
                     }
@@ -235,18 +317,21 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                 text,
                             } => {
                                 let text: SharedString = text.clone().into();
+                                let syntax = syntax_spans[i].clone();
                                 rows.push(Row::SplitLine {
                                     left: Some(Cell {
                                         no: *old_no,
                                         kind: LineKind::Context,
                                         text: text.clone(),
                                         intra: Vec::new(),
+                                        syntax: syntax.clone(),
                                     }),
                                     right: Some(Cell {
                                         no: *new_no,
                                         kind: LineKind::Context,
                                         text,
                                         intra: Vec::new(),
+                                        syntax,
                                     }),
                                 });
                                 i += 1;
@@ -264,6 +349,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                         kind: LineKind::Added,
                                         text: text.clone().into(),
                                         intra: intra.clone(),
+                                        syntax: syntax_spans[i].clone(),
                                     }),
                                 });
                                 i += 1;
@@ -293,6 +379,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                                 kind: LineKind::Removed,
                                                 text: text.clone().into(),
                                                 intra: intra.clone(),
+                                                syntax: syntax_spans[start + pair].clone(),
                                             },
                                             _ => unreachable!(),
                                         }
@@ -308,6 +395,7 @@ fn build_rows(diff: &PrDiff, mode: ViewMode) -> (Vec<Row>, Vec<usize>, Vec<usize
                                                 kind: LineKind::Added,
                                                 text: text.clone().into(),
                                                 intra: intra.clone(),
+                                                syntax: syntax_spans[mid + pair].clone(),
                                             },
                                             _ => unreachable!(),
                                         }
@@ -344,25 +432,70 @@ fn kind_style(kind: LineKind) -> (Option<gpui::Rgba>, Option<gpui::Rgba>, &'stat
     }
 }
 
-/// Line text with word-level highlight ranges, shared by unified rows and
-/// split cells.
+/// Overlay syntax color spans and intra word-diff background ranges into one
+/// sorted, non-overlapping highlight list: ranges are split at every boundary
+/// of either input, so an overlap gets the combined style (token foreground +
+/// intra background). Both inputs are sorted and non-overlapping; all
+/// boundaries come from them unchanged, so char-boundary safety is preserved.
+fn merge_highlights(
+    syntax: &[(Range<usize>, syntax::Token)],
+    intra: &[Range<usize>],
+    word_bg: Option<gpui::Rgba>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut bounds = Vec::with_capacity(2 * (syntax.len() + intra.len()));
+    for (range, _) in syntax {
+        bounds.push(range.start);
+        bounds.push(range.end);
+    }
+    for range in intra {
+        bounds.push(range.start);
+        bounds.push(range.end);
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let mut out: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let (mut si, mut ii) = (0, 0);
+    for seg in bounds.windows(2) {
+        let (start, end) = (seg[0], seg[1]);
+        while si < syntax.len() && syntax[si].0.end <= start {
+            si += 1;
+        }
+        while ii < intra.len() && intra[ii].end <= start {
+            ii += 1;
+        }
+        let token = (si < syntax.len() && syntax[si].0.start <= start).then(|| syntax[si].1);
+        let in_intra = ii < intra.len() && intra[ii].start <= start;
+        if token.is_none() && !in_intra {
+            continue;
+        }
+        let mut style = token.map(theme::token_style).unwrap_or_default();
+        if in_intra {
+            style.background_color = word_bg.map(Into::into);
+        }
+        match out.last_mut() {
+            // Coalesce adjacent identically-styled segments.
+            Some((prev, prev_style)) if prev.end == start && *prev_style == style => {
+                prev.end = end
+            }
+            _ => out.push((start..end, style)),
+        }
+    }
+    out
+}
+
+/// Line text with syntax colors overlaid with word-level highlight ranges,
+/// shared by unified rows and split cells.
 fn line_content(
     text: &SharedString,
+    syntax: &[(Range<usize>, syntax::Token)],
     intra: &[Range<usize>],
     word_bg: Option<gpui::Rgba>,
 ) -> gpui::AnyElement {
-    if intra.is_empty() {
+    let highlights = merge_highlights(syntax, intra, word_bg);
+    if highlights.is_empty() {
         div().child(text.clone()).into_any_element()
     } else {
-        let highlights = intra.iter().map(|range| {
-            (
-                range.clone(),
-                HighlightStyle {
-                    background_color: Some(word_bg.unwrap().into()),
-                    ..Default::default()
-                },
-            )
-        });
         StyledText::new(text.clone())
             .with_highlights(highlights)
             .into_any_element()
@@ -516,6 +649,7 @@ impl ReviewApp {
                 kind,
                 text,
                 intra,
+                syntax,
             } => {
                 let (row_bg, word_bg, marker, marker_color) = kind_style(*kind);
                 let number = |no: Option<u32>| {
@@ -544,7 +678,11 @@ impl ReviewApp {
                             .text_color(marker_color)
                             .child(SharedString::from(marker)),
                     )
-                    .child(div().whitespace_nowrap().child(line_content(text, intra, word_bg)))
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .child(line_content(text, syntax, intra, word_bg)),
+                    )
                     .into_any_element()
             }
             Row::SplitLine { left, right } => {
@@ -585,7 +723,7 @@ impl ReviewApp {
                     .child(
                         div()
                             .whitespace_nowrap()
-                            .child(line_content(&cell.text, &cell.intra, word_bg)),
+                            .child(line_content(&cell.text, &cell.syntax, &cell.intra, word_bg)),
                     )
                 };
                 // w_full is load-bearing: without a definite row width the row
@@ -935,6 +1073,120 @@ mod tests {
             }
             _ => panic!("expected split line"),
         }
+    }
+
+    use syntax::Token;
+
+    fn style(token: Token) -> HighlightStyle {
+        theme::token_style(token)
+    }
+
+    fn style_bg(token: Option<Token>) -> HighlightStyle {
+        let mut style = token.map(style).unwrap_or_default();
+        style.background_color = Some(theme::added_word_bg().into());
+        style
+    }
+
+    #[test]
+    fn merge_syntax_only() {
+        let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None),
+            vec![(0..2, style(Token::Keyword)), (3..7, style(Token::Function))]
+        );
+    }
+
+    #[test]
+    fn merge_intra_only() {
+        let bg = Some(theme::added_word_bg());
+        assert_eq!(
+            merge_highlights(&[], &[2..5], bg),
+            vec![(2..5, style_bg(None))]
+        );
+    }
+
+    #[test]
+    fn merge_partial_overlap() {
+        let bg = Some(theme::added_word_bg());
+        let syntax = [(0..6, Token::String)];
+        assert_eq!(
+            merge_highlights(&syntax, &[4..8], bg),
+            vec![
+                (0..4, style(Token::String)),
+                (4..6, style_bg(Some(Token::String))),
+                (6..8, style_bg(None)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_intra_spanning_multiple_tokens() {
+        let bg = Some(theme::added_word_bg());
+        let syntax = [(0..3, Token::Keyword), (5..8, Token::Number)];
+        assert_eq!(
+            merge_highlights(&syntax, &[1..7], bg),
+            vec![
+                (0..1, style(Token::Keyword)),
+                (1..3, style_bg(Some(Token::Keyword))),
+                (3..5, style_bg(None)),
+                (5..7, style_bg(Some(Token::Number))),
+                (7..8, style(Token::Number)),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_adjacent_ranges() {
+        // Same style across a shared boundary coalesces; different styles
+        // stay split exactly at the boundary.
+        let syntax = [(0..2, Token::Keyword), (2..4, Token::Keyword)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None),
+            vec![(0..4, style(Token::Keyword))]
+        );
+        let syntax = [(0..2, Token::Keyword), (2..4, Token::Type)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None),
+            vec![(0..2, style(Token::Keyword)), (2..4, style(Token::Type))]
+        );
+        let bg = Some(theme::added_word_bg());
+        assert_eq!(
+            merge_highlights(&[], &[0..2, 2..4], bg),
+            vec![(0..4, style_bg(None))]
+        );
+    }
+
+    #[test]
+    fn hunk_syntax_takes_spans_from_the_right_side() {
+        let lang = syntax::language_for_path("x.rs");
+        let rows = vec![
+            ctx(1, 1, "fn f() {"),
+            rem(2, "// gone", Vec::new()),
+            add(2, "    let b = 2;", Vec::new()),
+            ctx(3, 3, "}"),
+        ];
+        let spans = hunk_syntax(lang, &rows);
+        assert_eq!(spans.len(), 4);
+        // Context: from the new side.
+        assert!(spans[0].contains(&(0..2, Token::Keyword)));
+        // Removed: highlighted as part of old_source — a comment.
+        assert_eq!(spans[1], vec![(0..7, Token::Comment)]);
+        // Added: highlighted as part of new_source — `let` keyword.
+        assert!(spans[2].contains(&(4..7, Token::Keyword)));
+    }
+
+    #[test]
+    fn hunk_syntax_guardrails() {
+        let rows = vec![ctx(1, 1, "fn f() {}")];
+        // No language → no spans.
+        assert_eq!(hunk_syntax(None, &rows), vec![Vec::new()]);
+        // Over-long line stays plain even when the hunk is highlighted.
+        let lang = syntax::language_for_path("x.rs");
+        let long = format!("// {}", "x".repeat(5000));
+        let rows = vec![ctx(1, 1, "fn f() {}"), ctx(2, 2, &long)];
+        let spans = hunk_syntax(lang, &rows);
+        assert!(!spans[0].is_empty());
+        assert!(spans[1].is_empty());
     }
 
     #[test]

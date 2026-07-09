@@ -11,6 +11,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
+syntax = { path = "../syntax" }
 gpui = "0.2"
 gpui-component = "0.5"
 gpui-component-assets = "0.5"

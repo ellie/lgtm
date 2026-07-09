@@ -1,7 +1,8 @@
 //! Catppuccin Mocha, hardcoded for now. Helix-theme loading comes later.
 
-use gpui::{rgb, rgba, App, Hsla, Rgba};
+use gpui::{rgb, rgba, App, FontStyle, HighlightStyle, Hsla, Rgba};
 use gpui_component::{Theme, ThemeMode};
+use syntax::Token;
 
 pub fn base() -> Rgba {
     rgb(0x1e1e2e)
@@ -106,6 +107,32 @@ pub fn apply_ui_theme(cx: &mut App) {
     theme.scrollbar_thumb = overlay0.opacity(0.5);
     theme.scrollbar_thumb_hover = overlay0;
     theme.window_border = surface0;
+}
+
+/// Catppuccin Mocha syntax palette for tree-sitter tokens. Variable and
+/// Embedded map to the plain text color (syntax spans for them are not
+/// emitted, so this is belt-and-braces).
+pub fn token_style(token: Token) -> HighlightStyle {
+    let (color, italic) = match token {
+        Token::Keyword => (0xcba6f7, false),                 // mauve
+        Token::Function => (0x89b4fa, false),                // blue
+        Token::Type => (0xf9e2af, false),                    // yellow
+        Token::String => (0xa6e3a1, false),                  // green
+        Token::Number | Token::Constant => (0xfab387, false), // peach
+        Token::Comment => (0x6c7086, true),                  // overlay0
+        Token::Property => (0xb4befe, false),                // lavender
+        Token::Variable | Token::Embedded => (0xcdd6f4, false), // text
+        Token::Parameter => (0xeba0ac, true),                // maroon
+        Token::Operator => (0x89dceb, false),                // sky
+        Token::Punctuation => (0x9399b2, false),             // overlay2
+        Token::Attribute | Token::Label => (0xf9e2af, false), // yellow
+        Token::Namespace => (0xfab387, true),                // peach
+    };
+    HighlightStyle {
+        color: Some(rgb(color).into()),
+        font_style: italic.then_some(FontStyle::Italic),
+        ..Default::default()
+    }
 }
 
 /// Split view: background for the absent side of a one-sided row — darker

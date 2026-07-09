@@ -1,0 +1,26 @@
+[package]
+name = "syntax"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tree-sitter = "0.25"
+tree-sitter-highlight = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-python = "0.25"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-toml-ng = "0.7"
+tree-sitter-yaml = "0.7"
+tree-sitter-html = "0.23"
+tree-sitter-css = "0.23"
+tree-sitter-elixir = "0.3"
+tree-sitter-gleam = { git = "https://github.com/gleam-lang/tree-sitter-gleam", rev = "c610c282ef73f830d80c1f0999dce8e83f024ef5" }
+tree-sitter-heex = "0.8"
