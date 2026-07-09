@@ -117,6 +117,36 @@ pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
     serde_json::from_str(&json).context("unexpected gh pr view JSON")
 }
 
+/// One row of `gh pr list` output, for the PR picker.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrSummary {
+    pub number: u64,
+    pub title: String,
+    pub author: Author,
+    pub state: String,
+    pub is_draft: bool,
+    pub head_ref_name: String,
+    pub updated_at: String,
+}
+
+/// Open PRs for a repo, most recently updated first (gh's default order).
+pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
+    let json = gh(&[
+        "pr",
+        "list",
+        "--repo",
+        &format!("{owner}/{repo}"),
+        "--state",
+        "open",
+        "--limit",
+        "200",
+        "--json",
+        "number,title,author,state,isDraft,headRefName,updatedAt",
+    ])?;
+    serde_json::from_str(&json).context("unexpected gh pr list JSON")
+}
+
 pub fn fetch_patch(loc: &PrLocator) -> Result<String> {
     gh(&[
         "pr",
@@ -165,5 +195,38 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(resolve_pr_arg("not-a-pr").is_err());
+    }
+
+    #[test]
+    fn deserializes_pr_list_json() {
+        let json = r#"[
+            {
+                "number": 3468,
+                "title": "printer: add --field-name-terminator flag",
+                "author": {"id": "x", "is_bot": false, "login": "alice", "name": "Alice"},
+                "state": "OPEN",
+                "isDraft": false,
+                "headRefName": "field-name-terminator",
+                "updatedAt": "2026-07-01T12:34:56Z"
+            },
+            {
+                "number": 3470,
+                "title": "wip: experiment",
+                "author": {"login": "bob"},
+                "state": "OPEN",
+                "isDraft": true,
+                "headRefName": "bob/wip",
+                "updatedAt": "2026-06-30T08:00:00Z"
+            }
+        ]"#;
+        let prs: Vec<PrSummary> = serde_json::from_str(json).unwrap();
+        assert_eq!(prs.len(), 2);
+        assert_eq!(prs[0].number, 3468);
+        assert_eq!(prs[0].author.login, "alice");
+        assert_eq!(prs[0].state, "OPEN");
+        assert!(!prs[0].is_draft);
+        assert_eq!(prs[0].head_ref_name, "field-name-terminator");
+        assert_eq!(prs[0].updated_at, "2026-07-01T12:34:56Z");
+        assert!(prs[1].is_draft);
     }
 }

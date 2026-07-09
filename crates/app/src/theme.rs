@@ -135,6 +135,11 @@ pub fn token_style(token: Token) -> HighlightStyle {
     }
 }
 
+/// Dimming layer behind the command palette.
+pub fn palette_backdrop() -> Rgba {
+    rgba(0x11111baa)
+}
+
 /// Split view: background for the absent side of a one-sided row — darker
 /// than any content row so it clearly reads as "nothing here".
 pub fn void_cell_bg() -> Rgba {

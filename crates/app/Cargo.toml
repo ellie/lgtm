@@ -16,3 +16,4 @@ syntax = { path = "../syntax" }
 gpui = "0.2"
 gpui-component = "0.5"
 gpui-component-assets = "0.5"
+fuzzy-matcher = "0.3"

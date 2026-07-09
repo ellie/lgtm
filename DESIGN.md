@@ -184,10 +184,14 @@ keeps no line cache of its own and just re-requests visible lines each frame).
 Start by leaning on that; add our own persistent LRU only if profiling shows
 reshaping in steady-state scroll.
 
-**Scrollbar hunk markers**: the scrollbar paints one colored marker per hunk
-(add/remove/modify colors) across the whole PR, so the scrollbar doubles as a
-change map. Marker positions are computed once per diff load on the background
-executor — rows are static, so unlike Zed we never need to recompute them.
+**Minimap** (supersedes the earlier scrollbar-markers plan): a narrow column
+(~100px) beside the diff showing the whole item zoomed out — one thin bar per
+row (or per N rows when downsampled), width proportional to line length,
+colored by row kind (add green / remove red / context dim; header ticks in
+accent), mirrored half-columns in split mode. Painted as coalesced GPU quads
+via a canvas element — no text rendering, so it's cheap at any size. A
+viewport rectangle tracks the scroll position; click/drag scrolls. Rows are
+static per diff load, so the quad list is computed once, not per frame.
 
 **Start with `uniform_list` of styled elements; keep a trapdoor.** If
 per-row element overhead ever shows in profiles, `DiffView` drops to a single
