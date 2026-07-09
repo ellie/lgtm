@@ -555,7 +555,7 @@ impl ReviewApp {
                         .flex()
                         .items_center();
                     let Some(cell) = cell else {
-                        return base.bg(theme::mantle());
+                        return base.bg(theme::void_cell_bg());
                     };
                     let (row_bg, word_bg, marker, marker_color) = kind_style(cell.kind);
                     let mut side = base;
@@ -591,10 +591,16 @@ impl ReviewApp {
                     .flex()
                     .child(cell(left))
                     .child(
-                        cell(right)
+                        div()
+                            .w(px(6.))
+                            .flex_shrink_0()
+                            .h_full()
+                            .bg(theme::crust())
                             .border_l_1()
+                            .border_r_1()
                             .border_color(theme::surface0()),
                     )
+                    .child(cell(right))
                     .into_any_element()
             }
         }

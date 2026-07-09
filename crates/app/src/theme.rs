@@ -108,6 +108,12 @@ pub fn apply_ui_theme(cx: &mut App) {
     theme.window_border = surface0;
 }
 
+/// Split view: background for the absent side of a one-sided row — darker
+/// than any content row so it clearly reads as "nothing here".
+pub fn void_cell_bg() -> Rgba {
+    rgba(0x11111b99)
+}
+
 /// Low-alpha tints: syntax/text must stay readable on top. Never opaque.
 pub fn added_row_bg() -> Rgba {
     rgba(0xa6e3a120)
