@@ -4,9 +4,10 @@ use anyhow::anyhow;
 use diff_core::{DiffRow, FileStatus, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, div, prelude::*, px, size, uniform_list, App, Application, Bounds, Context,
-    FocusHandle, HighlightStyle, Hsla, KeyBinding, Keystroke, ListHorizontalSizingBehavior,
-    MouseButton, PathPromptOptions, ScrollStrategy, SharedString, StyledText, Subscription,
+    actions, div, font, prelude::*, px, size, uniform_list, App, Application, Bounds,
+    ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding, Keystroke,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, StyledText, Subscription,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
@@ -24,12 +25,19 @@ const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
 const TEXT_SIZE: f32 = 13.0;
 
+/// Gutter widths in px, matching render_row's fixed-width children: unified is
+/// two 44px line-number columns + a 28px marker; each split cell is one of
+/// each. Mouse→column math depends on these.
+const UNIFIED_GUTTER: f32 = 44. + 44. + 28.;
+const SPLIT_GUTTER: f32 = 44. + 28.;
+const SPLIT_DIVIDER: f32 = 6.0;
+
 actions!(
     review,
     [
         NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
         ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
-        PaletteDown, PaletteBack
+        PaletteDown, PaletteBack, ClearSelection, CopySelection
     ]
 );
 
@@ -73,6 +81,11 @@ fn main() {
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
+                // Selection: escape/cmd-c only fire while the diff pane has
+                // focus; with the palette open its input has focus, so the
+                // palette's own escape routing wins by construction.
+                KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
+                KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
@@ -162,6 +175,97 @@ enum Row {
         left: Option<Cell>,
         right: Option<Cell>,
     },
+}
+
+/// Which text stream a selection runs through. Split selections are locked to
+/// the side where the drag started, like GitHub; the other side paints nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelSide {
+    Unified,
+    Left,
+    Right,
+}
+
+/// A point in text space: display row index + char index into that row's text
+/// (char, not byte — convert to byte offsets only when slicing). Ordered by
+/// (row, col), which is exactly document order.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct RowCol {
+    row: usize,
+    col: usize,
+}
+
+/// Anchor stays where the drag started; head follows the mouse. The ordered
+/// pair is derived on use, so dragging upward needs no special casing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Selection {
+    side: SelSide,
+    anchor: RowCol,
+    head: RowCol,
+}
+
+impl Selection {
+    fn ordered(&self) -> (RowCol, RowCol) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// The text a selection on `side` runs through for this row, if any. Rows
+/// that aren't text (headers, spacers, binary) and absent split cells yield
+/// None: they're selectable-through but contribute nothing.
+fn row_side_text(row: &Row, side: SelSide) -> Option<&str> {
+    match (row, side) {
+        (Row::Line { text, .. }, SelSide::Unified) => Some(text.as_ref()),
+        (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.text.as_ref()),
+        (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.text.as_ref()),
+        _ => None,
+    }
+}
+
+/// Byte offset of char index `col`, clamped to the end of the text.
+fn char_to_byte(text: &str, col: usize) -> usize {
+    text.char_indices()
+        .nth(col)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// The selected byte range within display row `row_ix`, or None if the row
+/// contributes nothing (outside the selection, not a text row, or the selected
+/// side is absent). The range can be empty (e.g. a selected empty line): copy
+/// keeps it as an empty line, painting skips it.
+fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Range<usize>> {
+    let (start, end) = sel.ordered();
+    if row_ix < start.row || row_ix > end.row {
+        return None;
+    }
+    let text = row_side_text(row, sel.side)?;
+    let chars = text.chars().count();
+    let start_col = if row_ix == start.row { start.col.min(chars) } else { 0 };
+    let end_col = if row_ix == end.row { end.col.min(chars) } else { chars };
+    if start_col > end_col {
+        return None;
+    }
+    Some(char_to_byte(text, start_col)..char_to_byte(text, end_col))
+}
+
+/// The selected text: each contributing row's selected substring, joined with
+/// newlines. Header/spacer rows and absent split cells are skipped entirely
+/// (no blank line for them).
+fn selection_text(sel: &Selection, rows: &[Row]) -> String {
+    let (start, end) = sel.ordered();
+    let mut parts = Vec::new();
+    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
+        if let Some(range) = row_selection_range(sel, ix, &rows[ix]) {
+            let text = row_side_text(&rows[ix], sel.side).unwrap_or_default();
+            parts.push(&text[range]);
+        }
+    }
+    parts.join("\n")
 }
 
 /// Guardrails: hunk sides bigger than this render without syntax highlighting.
@@ -453,17 +557,20 @@ fn kind_style(kind: LineKind) -> (Option<gpui::Rgba>, Option<gpui::Rgba>, &'stat
     }
 }
 
-/// Overlay syntax color spans and intra word-diff background ranges into one
-/// sorted, non-overlapping highlight list: ranges are split at every boundary
-/// of either input, so an overlap gets the combined style (token foreground +
-/// intra background). Both inputs are sorted and non-overlapping; all
-/// boundaries come from them unchanged, so char-boundary safety is preserved.
+/// Overlay syntax color spans, intra word-diff background ranges, and the
+/// selection background into one sorted, non-overlapping highlight list:
+/// ranges are split at every boundary of any input, so an overlap gets the
+/// combined style (token foreground + a background). Where the selection
+/// overlaps an intra range, the selection background wins; the syntax
+/// foreground is kept either way. All inputs are sorted and non-overlapping
+/// with char-boundary offsets, so char-boundary safety is preserved.
 fn merge_highlights(
     syntax: &[(Range<usize>, syntax::Token)],
     intra: &[Range<usize>],
     word_bg: Option<gpui::Rgba>,
+    selection: Option<Range<usize>>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-    let mut bounds = Vec::with_capacity(2 * (syntax.len() + intra.len()));
+    let mut bounds = Vec::with_capacity(2 * (syntax.len() + intra.len() + 1));
     for (range, _) in syntax {
         bounds.push(range.start);
         bounds.push(range.end);
@@ -471,6 +578,10 @@ fn merge_highlights(
     for range in intra {
         bounds.push(range.start);
         bounds.push(range.end);
+    }
+    if let Some(sel) = &selection {
+        bounds.push(sel.start);
+        bounds.push(sel.end);
     }
     bounds.sort_unstable();
     bounds.dedup();
@@ -487,12 +598,18 @@ fn merge_highlights(
         }
         let token = (si < syntax.len() && syntax[si].0.start <= start).then(|| syntax[si].1);
         let in_intra = ii < intra.len() && intra[ii].start <= start;
-        if token.is_none() && !in_intra {
+        let in_sel = selection
+            .as_ref()
+            .is_some_and(|sel| sel.start <= start && start < sel.end);
+        if token.is_none() && !in_intra && !in_sel {
             continue;
         }
         let mut style = token.map(theme::token_style).unwrap_or_default();
         if in_intra {
             style.background_color = word_bg.map(Into::into);
+        }
+        if in_sel {
+            style.background_color = Some(theme::selection_bg().into());
         }
         match out.last_mut() {
             // Coalesce adjacent identically-styled segments.
@@ -505,15 +622,16 @@ fn merge_highlights(
     out
 }
 
-/// Line text with syntax colors overlaid with word-level highlight ranges,
-/// shared by unified rows and split cells.
+/// Line text with syntax colors overlaid with word-level highlight ranges and
+/// the selection background, shared by unified rows and split cells.
 fn line_content(
     text: &SharedString,
     syntax: &[(Range<usize>, syntax::Token)],
     intra: &[Range<usize>],
     word_bg: Option<gpui::Rgba>,
+    selection: Option<Range<usize>>,
 ) -> gpui::AnyElement {
-    let highlights = merge_highlights(syntax, intra, word_bg);
+    let highlights = merge_highlights(syntax, intra, word_bg, selection);
     if highlights.is_empty() {
         div().child(text.clone()).into_any_element()
     } else {
@@ -523,7 +641,10 @@ fn line_content(
     }
 }
 
-fn render_row(row: &Row) -> gpui::AnyElement {
+/// `selection` is this row's selected byte range (side + non-empty range),
+/// computed by the caller via `row_selection_range`; its side always matches
+/// the row shape (Unified for Line rows, Left/Right for SplitLine rows).
+fn render_row(row: &Row, selection: Option<(SelSide, Range<usize>)>) -> gpui::AnyElement {
     let row_height = px(ROW_HEIGHT);
     match row {
         Row::Spacer => div().h(row_height).into_any_element(),
@@ -636,14 +757,23 @@ fn render_row(row: &Row) -> gpui::AnyElement {
                         .child(SharedString::from(marker)),
                 )
                 .child(
-                    div()
-                        .whitespace_nowrap()
-                        .child(line_content(text, syntax, intra, word_bg)),
+                    div().whitespace_nowrap().child(line_content(
+                        text,
+                        syntax,
+                        intra,
+                        word_bg,
+                        selection.map(|(_, range)| range),
+                    )),
                 )
                 .into_any_element()
         }
         Row::SplitLine { left, right } => {
-            let cell = |cell: &Option<Cell>| {
+            let (left_sel, right_sel) = match selection {
+                Some((SelSide::Left, range)) => (Some(range), None),
+                Some((SelSide::Right, range)) => (None, Some(range)),
+                _ => (None, None),
+            };
+            let cell = |cell: &Option<Cell>, sel: Option<Range<usize>>| {
                 let base = div()
                     .flex_1()
                     .min_w_0()
@@ -677,11 +807,13 @@ fn render_row(row: &Row) -> gpui::AnyElement {
                         .text_color(marker_color)
                         .child(SharedString::from(marker)),
                 )
-                .child(
-                    div()
-                        .whitespace_nowrap()
-                        .child(line_content(&cell.text, &cell.syntax, &cell.intra, word_bg)),
-                )
+                .child(div().whitespace_nowrap().child(line_content(
+                    &cell.text,
+                    &cell.syntax,
+                    &cell.intra,
+                    word_bg,
+                    sel,
+                )))
             };
             // w_full is load-bearing: without a definite row width the row
             // sizes to fit-content and the flex_1 halves collapse to their
@@ -690,7 +822,7 @@ fn render_row(row: &Row) -> gpui::AnyElement {
                 .h(row_height)
                 .w_full()
                 .flex()
-                .child(cell(left))
+                .child(cell(left, left_sel))
                 .child(
                     div()
                         .w(px(6.))
@@ -701,7 +833,7 @@ fn render_row(row: &Row) -> gpui::AnyElement {
                         .border_r_1()
                         .border_color(theme::surface0()),
                 )
-                .child(cell(right))
+                .child(cell(right, right_sel))
                 .into_any_element()
         }
     }
@@ -733,6 +865,10 @@ struct ItemData {
     scroll: UniformListScrollHandle,
     additions: u32,
     deletions: u32,
+    /// Mouse text selection, in display-row space. Per item (survives item
+    /// switching); cleared on view-mode toggle and refresh, where row indices
+    /// change meaning.
+    selection: Option<Selection>,
 }
 
 struct ReviewItem {
@@ -825,6 +961,7 @@ impl ReviewItem {
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
+                data.selection = None;
             }
             _ => {
                 self.state = ItemState::Ready(Box::new(ItemData {
@@ -838,6 +975,7 @@ impl ReviewItem {
                     scroll: UniformListScrollHandle::new(),
                     additions,
                     deletions,
+                    selection: None,
                 }));
             }
         }
@@ -1207,6 +1345,11 @@ struct ReviewApp {
     /// lands if the generation it captured is still current.
     palette_gen: u64,
     palette_scroll: UniformListScrollHandle,
+    /// Where the current selection drag started (side locked at mouse-down);
+    /// None when no drag is in progress.
+    drag_anchor: Option<(SelSide, RowCol)>,
+    /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
+    char_width: Option<Pixels>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1252,6 +1395,8 @@ impl ReviewApp {
             palette_input,
             palette_gen: 0,
             palette_scroll: UniformListScrollHandle::new(),
+            drag_anchor: None,
+            char_width: None,
             _subscriptions,
         };
         for source in sources {
@@ -1277,6 +1422,66 @@ impl ReviewApp {
             ItemState::Ready(data) => Some(data),
             _ => None,
         }
+    }
+
+    /// Advance width of one monospace cell, measured once via the text system
+    /// (Menlo is monospace, so 'm' stands in for every glyph).
+    fn char_width(&mut self, window: &Window) -> Pixels {
+        *self.char_width.get_or_insert_with(|| {
+            let text_system = window.text_system();
+            let font_id = text_system.resolve_font(&font(MONO));
+            text_system
+                .em_advance(font_id, px(TEXT_SIZE))
+                .unwrap_or(px(TEXT_SIZE * 0.6))
+        })
+    }
+
+    /// Window position → (side, row/col) in the active diff. Row from the
+    /// uniform_list's scroll offset and painted bounds (both kept fresh each
+    /// frame on the tracked scroll handle); col from monospace arithmetic.
+    /// `locked` pins a split drag to the side where it started. Pure mouse
+    /// math — verified manually, not unit-tested.
+    fn pane_hit(
+        &self,
+        position: Point<Pixels>,
+        char_width: Pixels,
+        locked: Option<SelSide>,
+    ) -> Option<(SelSide, RowCol)> {
+        let data = self.active_data()?;
+        if data.rows.is_empty() {
+            return None;
+        }
+        let (bounds, offset) = {
+            let state = data.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        // offset.y is negative when scrolled down.
+        let y = f32::from(position.y - bounds.top() - offset.y);
+        let row = ((y / ROW_HEIGHT).floor().max(0.) as usize).min(data.rows.len() - 1);
+        let rel_x = f32::from(position.x - bounds.left());
+        let (side, text_x) = match data.mode {
+            // offset.x is negative when scrolled right (unified mode only;
+            // split uses FitList and never scrolls horizontally).
+            ViewMode::Unified => (
+                SelSide::Unified,
+                rel_x - f32::from(offset.x) - UNIFIED_GUTTER,
+            ),
+            ViewMode::Split => {
+                let half = (f32::from(bounds.size.width) - SPLIT_DIVIDER) / 2.;
+                let side = locked.unwrap_or(if rel_x < half + SPLIT_DIVIDER / 2. {
+                    SelSide::Left
+                } else {
+                    SelSide::Right
+                });
+                let cell_x = match side {
+                    SelSide::Right => rel_x - half - SPLIT_DIVIDER,
+                    _ => rel_x,
+                };
+                (side, cell_x - SPLIT_GUTTER)
+            }
+        };
+        let col = (text_x / f32::from(char_width)).round().max(0.) as usize;
+        Some((side, RowCol { row, col }))
     }
 
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
@@ -1644,6 +1849,7 @@ impl ReviewApp {
         };
         // Best-effort position preservation: stay on the same file.
         let file_pos = data.file_rows.iter().rposition(|&ix| ix <= data.cursor);
+        data.selection = None;
         data.mode = match data.mode {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
@@ -2107,12 +2313,77 @@ impl Render for ReviewApp {
                     .font_family(MONO)
                     .text_size(px(TEXT_SIZE))
                     .line_height(px(ROW_HEIGHT))
+                    // Selection mouse listeners live on the diff pane only.
+                    // While the palette is open its occluding backdrop keeps
+                    // this hitbox from being hovered, so none of these fire;
+                    // the palette.is_none() guard documents (and backstops)
+                    // that. The Scrollbar stops propagation of its own
+                    // mouse-downs and thumb drags before they reach us.
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            if this.palette.is_some() {
+                                return;
+                            }
+                            window.focus(&this.focus_handle);
+                            let char_width = this.char_width(window);
+                            this.drag_anchor = this.pane_hit(event.position, char_width, None);
+                            // A plain click clears; a selection only appears
+                            // once the drag covers ≥ 1 char.
+                            if let Some(data) = this.active_data_mut() {
+                                if data.selection.take().is_some() {
+                                    cx.notify();
+                                }
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                        if !event.dragging() {
+                            return;
+                        }
+                        let Some((side, anchor)) = this.drag_anchor else {
+                            return;
+                        };
+                        let char_width = this.char_width(window);
+                        let Some((_, head)) = this.pane_hit(event.position, char_width, Some(side))
+                        else {
+                            return;
+                        };
+                        let selection = (head != anchor).then_some(Selection { side, anchor, head });
+                        if let Some(data) = this.active_data_mut() {
+                            if data.selection != selection {
+                                data.selection = selection;
+                                cx.notify();
+                            }
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| this.drag_anchor = None),
+                    )
+                    // Releases outside the pane (drag ended over the sidebar,
+                    // footer, …) must still end the drag.
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, _| this.drag_anchor = None),
+                    )
                     .child(
                         uniform_list("diff", data.rows.len(), move |range, _window, cx| {
                             let this = entity.read(cx);
                             match this.active_data() {
                                 Some(data) => {
-                                    range.filter_map(|ix| data.rows.get(ix)).map(render_row).collect()
+                                    let sel = data.selection;
+                                    range
+                                        .filter_map(|ix| data.rows.get(ix).map(|row| (ix, row)))
+                                        .map(|(ix, row)| {
+                                            let row_sel = sel.and_then(|sel| {
+                                                row_selection_range(&sel, ix, row)
+                                                    .filter(|range| !range.is_empty())
+                                                    .map(|range| (sel.side, range))
+                                            });
+                                            render_row(row, row_sel)
+                                        })
+                                        .collect()
                                 }
                                 None => Vec::new(),
                             }
@@ -2166,6 +2437,28 @@ impl Render for ReviewApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
+            // Bound in the "ReviewApp" context: these only fire while the
+            // diff pane has focus. With the palette open, focus sits in the
+            // palette input, so its escape routing (PaletteBack) wins.
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+                if let Some(data) = this.active_data_mut() {
+                    if data.selection.take().is_some() {
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CopySelection, _, cx| {
+                let Some(data) = this.active_data() else {
+                    return;
+                };
+                let Some(sel) = data.selection else {
+                    return;
+                };
+                let text = selection_text(&sel, &data.rows);
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
@@ -2396,7 +2689,7 @@ mod tests {
     fn merge_syntax_only() {
         let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
         assert_eq!(
-            merge_highlights(&syntax, &[], None),
+            merge_highlights(&syntax, &[], None, None),
             vec![(0..2, style(Token::Keyword)), (3..7, style(Token::Function))]
         );
     }
@@ -2405,7 +2698,7 @@ mod tests {
     fn merge_intra_only() {
         let bg = Some(theme::added_word_bg());
         assert_eq!(
-            merge_highlights(&[], &[2..5], bg),
+            merge_highlights(&[], &[2..5], bg, None),
             vec![(2..5, style_bg(None))]
         );
     }
@@ -2415,7 +2708,7 @@ mod tests {
         let bg = Some(theme::added_word_bg());
         let syntax = [(0..6, Token::String)];
         assert_eq!(
-            merge_highlights(&syntax, &[4..8], bg),
+            merge_highlights(&syntax, &[4..8], bg, None),
             vec![
                 (0..4, style(Token::String)),
                 (4..6, style_bg(Some(Token::String))),
@@ -2429,7 +2722,7 @@ mod tests {
         let bg = Some(theme::added_word_bg());
         let syntax = [(0..3, Token::Keyword), (5..8, Token::Number)];
         assert_eq!(
-            merge_highlights(&syntax, &[1..7], bg),
+            merge_highlights(&syntax, &[1..7], bg, None),
             vec![
                 (0..1, style(Token::Keyword)),
                 (1..3, style_bg(Some(Token::Keyword))),
@@ -2446,17 +2739,17 @@ mod tests {
         // stay split exactly at the boundary.
         let syntax = [(0..2, Token::Keyword), (2..4, Token::Keyword)];
         assert_eq!(
-            merge_highlights(&syntax, &[], None),
+            merge_highlights(&syntax, &[], None, None),
             vec![(0..4, style(Token::Keyword))]
         );
         let syntax = [(0..2, Token::Keyword), (2..4, Token::Type)];
         assert_eq!(
-            merge_highlights(&syntax, &[], None),
+            merge_highlights(&syntax, &[], None, None),
             vec![(0..2, style(Token::Keyword)), (2..4, style(Token::Type))]
         );
         let bg = Some(theme::added_word_bg());
         assert_eq!(
-            merge_highlights(&[], &[0..2, 2..4], bg),
+            merge_highlights(&[], &[0..2, 2..4], bg, None),
             vec![(0..4, style_bg(None))]
         );
     }
@@ -2578,5 +2871,173 @@ mod tests {
             .count();
         assert_eq!(unified_lines, 11);
         assert_eq!(split_lines, 8); // 4 (hunk 1) + 4 (hunk 2)
+    }
+
+    fn line(text: &str) -> Row {
+        Row::Line {
+            old_no: Some(1),
+            new_no: Some(1),
+            kind: LineKind::Context,
+            text: text.to_string().into(),
+            intra: Vec::new(),
+            syntax: Vec::new(),
+        }
+    }
+
+    fn split(left: Option<&str>, right: Option<&str>) -> Row {
+        let cell = |text: &str| Cell {
+            no: 1,
+            kind: LineKind::Context,
+            text: text.to_string().into(),
+            intra: Vec::new(),
+            syntax: Vec::new(),
+        };
+        Row::SplitLine {
+            left: left.map(cell),
+            right: right.map(cell),
+        }
+    }
+
+    fn sel(side: SelSide, anchor: (usize, usize), head: (usize, usize)) -> Selection {
+        Selection {
+            side,
+            anchor: RowCol { row: anchor.0, col: anchor.1 },
+            head: RowCol { row: head.0, col: head.1 },
+        }
+    }
+
+    #[test]
+    fn selection_ordered_swaps_backward_drags() {
+        let forward = sel(SelSide::Unified, (1, 3), (4, 2));
+        let backward = sel(SelSide::Unified, (4, 2), (1, 3));
+        assert_eq!(forward.ordered(), backward.ordered());
+        // Same row, backward drag: ordered by column.
+        let same_row = sel(SelSide::Unified, (2, 7), (2, 1));
+        let (start, end) = same_row.ordered();
+        assert_eq!((start.col, end.col), (1, 7));
+    }
+
+    #[test]
+    fn char_to_byte_multibyte() {
+        let text = "let s = \"héllo\";";
+        assert_eq!(char_to_byte(text, 0), 0);
+        assert_eq!(char_to_byte(text, 10), 10); // 'é'
+        assert_eq!(char_to_byte(text, 11), 12); // first 'l': 'é' is 2 bytes
+        assert_eq!(char_to_byte(text, 99), text.len()); // clamped
+        assert_eq!(&text[char_to_byte(text, 8)..char_to_byte(text, 14)], "\"héllo");
+    }
+
+    #[test]
+    fn row_range_unified_multi_row() {
+        let rows = vec![line("first line"), line("middle"), line("last line")];
+        let sel = sel(SelSide::Unified, (0, 6), (2, 4));
+        // First row: from col 6 to end of text.
+        assert_eq!(row_selection_range(&sel, 0, &rows[0]), Some(6..10));
+        // Middle row: fully selected, col 0 to end.
+        assert_eq!(row_selection_range(&sel, 1, &rows[1]), Some(0..6));
+        // Last row: col 0 to col 4.
+        assert_eq!(row_selection_range(&sel, 2, &rows[2]), Some(0..4));
+        // Outside the selection.
+        assert_eq!(row_selection_range(&sel, 3, &rows[0]), None);
+    }
+
+    #[test]
+    fn row_range_skips_non_text_rows() {
+        let header = Row::HunkHeader { label: "@@".into() };
+        let sel = sel(SelSide::Unified, (0, 0), (2, 3));
+        // Headers/spacers inside the span contribute nothing…
+        assert_eq!(row_selection_range(&sel, 1, &header), None);
+        assert_eq!(row_selection_range(&sel, 1, &Row::Spacer), None);
+        // …and split rows never match a Unified-side selection.
+        assert_eq!(row_selection_range(&sel, 1, &split(Some("x"), Some("y"))), None);
+    }
+
+    #[test]
+    fn row_range_split_sides_and_absent_cells() {
+        let rows = vec![
+            split(Some("left one"), Some("right one")),
+            split(None, Some("right only")),
+            split(Some("left only"), None),
+        ];
+        let right = sel(SelSide::Right, (0, 6), (2, 4));
+        assert_eq!(row_selection_range(&right, 0, &rows[0]), Some(6..9));
+        assert_eq!(row_selection_range(&right, 1, &rows[1]), Some(0..10));
+        // Selected side absent: contributes nothing.
+        assert_eq!(row_selection_range(&right, 2, &rows[2]), None);
+        let left = sel(SelSide::Left, (0, 5), (1, 3));
+        assert_eq!(row_selection_range(&left, 0, &rows[0]), Some(5..8));
+        assert_eq!(row_selection_range(&left, 1, &rows[1]), None);
+    }
+
+    #[test]
+    fn row_range_clamps_columns_to_text() {
+        let rows = vec![line("ab"), line("cdef")];
+        // Anchor col way past the end of a short line.
+        let sel = sel(SelSide::Unified, (0, 99), (1, 2));
+        assert_eq!(row_selection_range(&sel, 0, &rows[0]), Some(2..2)); // empty
+        assert_eq!(row_selection_range(&sel, 1, &rows[1]), Some(0..2));
+    }
+
+    #[test]
+    fn copy_assembles_contributing_rows() {
+        let rows = vec![
+            line("fn main() {"),
+            Row::HunkHeader { label: "@@".into() },
+            line(""),
+            line("    body();"),
+            line("}"),
+        ];
+        // From col 3 of row 0 through col 1 of row 4: the header is skipped
+        // (no blank line for it), the empty line survives as an empty line.
+        let forward = sel(SelSide::Unified, (0, 3), (4, 1));
+        assert_eq!(selection_text(&forward, &rows), "main() {\n\n    body();\n}");
+        // Backward drag over one row.
+        let backward = sel(SelSide::Unified, (0, 7), (0, 3));
+        assert_eq!(selection_text(&backward, &rows), "main");
+    }
+
+    #[test]
+    fn copy_split_takes_locked_side_only() {
+        let rows = vec![
+            split(Some("old a"), Some("new a")),
+            split(None, Some("new b")),
+            split(Some("old c"), None),
+        ];
+        let right = sel(SelSide::Right, (0, 0), (2, 5));
+        assert_eq!(selection_text(&right, &rows), "new a\nnew b");
+        let left = sel(SelSide::Left, (0, 0), (2, 5));
+        assert_eq!(selection_text(&left, &rows), "old a\nold c");
+    }
+
+    #[test]
+    fn copy_multibyte_slice() {
+        let rows = vec![line("let s = \"héllo\";")];
+        let quoted = sel(SelSide::Unified, (0, 8), (0, 14));
+        assert_eq!(selection_text(&quoted, &rows), "\"héllo");
+    }
+
+    #[test]
+    fn merge_selection_wins_over_intra() {
+        let bg = Some(theme::added_word_bg());
+        let sel_style = |token: Option<Token>| {
+            let mut style = token.map(style).unwrap_or_default();
+            style.background_color = Some(theme::selection_bg().into());
+            style
+        };
+        // Intra 2..6, selection 4..8: the overlap 4..6 paints selection bg.
+        assert_eq!(
+            merge_highlights(&[], &[2..6], bg, Some(4..8)),
+            vec![(2..4, style_bg(None)), (4..8, sel_style(None))]
+        );
+        // Selection over a syntax token keeps the token foreground.
+        let syntax = [(0..4, Token::Keyword)];
+        assert_eq!(
+            merge_highlights(&syntax, &[], None, Some(2..6)),
+            vec![
+                (0..2, style(Token::Keyword)),
+                (2..4, sel_style(Some(Token::Keyword))),
+                (4..6, sel_style(None)),
+            ]
+        );
     }
 }

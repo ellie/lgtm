@@ -146,6 +146,12 @@ pub fn void_cell_bg() -> Rgba {
     rgba(0x11111b99)
 }
 
+/// Text selection in the diff pane — same blue.opacity(0.3) injected into the
+/// gpui-component theme as `selection` in `apply_ui_theme`.
+pub fn selection_bg() -> Rgba {
+    rgba(0x89b4fa4d)
+}
+
 /// Low-alpha tints: syntax/text must stay readable on top. Never opaque.
 pub fn added_row_bg() -> Rgba {
     rgba(0xa6e3a120)
