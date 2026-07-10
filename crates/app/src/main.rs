@@ -4,13 +4,15 @@ use anyhow::anyhow;
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, div, font, point, prelude::*, px, relative, size, uniform_list, App, Application,
-    Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding, Keystroke,
-    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, StyledText, Subscription,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
+    Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, StyledText,
+    Subscription, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Escape as InputEscape, Input, InputEvent, InputState},
@@ -38,7 +40,7 @@ actions!(
     [
         NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
         ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
-        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter
+        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap
     ]
 );
 
@@ -81,6 +83,7 @@ fn main() {
                 KeyBinding::new("home", GoToTop, Some("ReviewApp")),
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
+                KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 // Only while the diff pane has focus; typing `/` in any input
                 // stays a plain character.
@@ -1018,6 +1021,258 @@ fn render_row(
     }
 }
 
+// --- Minimap ---------------------------------------------------------------
+
+/// Width of the minimap column on the right edge of the diff pane.
+const MINIMAP_WIDTH: f32 = 100.0;
+/// Horizontal inset of the bars inside the column.
+const MINIMAP_PAD: f32 = 4.0;
+/// Gap between the two half-columns mirroring split view.
+const MINIMAP_GAP: f32 = 2.0;
+/// A line this long (or longer) draws a full-width bar.
+const MAX_MINIMAP_CHARS: usize = 160;
+
+/// One display row reduced to what the minimap paints: a kind (color) and a
+/// width fraction. Index-aligned with `ItemData::rows`, recomputed wherever
+/// the rows are rebuilt.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct MinimapRow {
+    kind: MinimapKind,
+    /// Line length / MAX_MINIMAP_CHARS, capped at 1. For SplitPair rows this
+    /// is the max of the two halves (used by downsample grouping).
+    len_frac: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MinimapKind {
+    Context,
+    Added,
+    Removed,
+    /// A split-view row: per-half width fractions, and whether each half
+    /// holds a change (left = removed present, right = added present) as
+    /// opposed to context. Absent halves have a zero fraction.
+    SplitPair {
+        left_frac: f32,
+        right_frac: f32,
+        left: bool,
+        right: bool,
+    },
+    Header,
+    Gap,
+    Blank,
+}
+
+/// Fraction of a full-width minimap bar for one line of text. Counting stops
+/// at the cap, so pathological lines cost nothing extra.
+fn line_frac(text: &str) -> f32 {
+    text.chars().take(MAX_MINIMAP_CHARS).count() as f32 / MAX_MINIMAP_CHARS as f32
+}
+
+/// Reduce display rows to minimap rows, one per row, index-aligned.
+fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
+    rows.iter()
+        .map(|row| match row {
+            Row::Spacer | Row::Binary => MinimapRow {
+                kind: MinimapKind::Blank,
+                len_frac: 0.,
+            },
+            Row::FileHeader { .. } | Row::HunkHeader { .. } => MinimapRow {
+                kind: MinimapKind::Header,
+                len_frac: 1.,
+            },
+            Row::Gap { .. } => MinimapRow {
+                kind: MinimapKind::Gap,
+                len_frac: 1.,
+            },
+            Row::Line { kind, text, .. } => MinimapRow {
+                kind: match kind {
+                    LineKind::Context => MinimapKind::Context,
+                    LineKind::Added => MinimapKind::Added,
+                    LineKind::Removed => MinimapKind::Removed,
+                },
+                len_frac: line_frac(text),
+            },
+            Row::SplitLine { left, right } => {
+                let frac = |cell: &Option<Cell>| {
+                    cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.)
+                };
+                let (left_frac, right_frac) = (frac(left), frac(right));
+                MinimapRow {
+                    kind: MinimapKind::SplitPair {
+                        left_frac,
+                        right_frac,
+                        left: matches!(left, Some(c) if c.kind == LineKind::Removed),
+                        right: matches!(right, Some(c) if c.kind == LineKind::Added),
+                    },
+                    len_frac: left_frac.max(right_frac),
+                }
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MinimapLane {
+    /// Bar from the left edge across the full usable width (unified rows and
+    /// header/gap ticks).
+    Full,
+    /// Left half-column (split view's left cell).
+    Left,
+    /// Right half-column (split view's right cell).
+    Right,
+}
+
+/// Bar colors as a plain enum so the precompute stays theme-free and testable;
+/// painting maps them to theme colors.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MinimapColor {
+    Added,
+    Removed,
+    Context,
+    Header,
+    Gap,
+}
+
+/// Downsample priority: when several rows share one pixel-row, the highest
+/// wins (Blank rows contribute nothing and lose to everything).
+fn minimap_priority(color: MinimapColor) -> u8 {
+    match color {
+        MinimapColor::Removed => 5,
+        MinimapColor::Added => 4,
+        MinimapColor::Header => 3,
+        MinimapColor::Gap => 2,
+        MinimapColor::Context => 1,
+    }
+}
+
+/// A coalesced vertical run of identical bars, in slot space: a slot is one
+/// painted row of the minimap, `slot_h` px tall, covering `group` display
+/// rows. `tick` runs paint 1px tall at the slot top instead of filling it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct MinimapRun {
+    start: u32,
+    /// Exclusive.
+    end: u32,
+    lane: MinimapLane,
+    color: MinimapColor,
+    frac: f32,
+    tick: bool,
+}
+
+struct MinimapLayout {
+    /// Painted height of one slot: clamp(pane_height / total_rows, 1, 3).
+    slot_h: f32,
+    /// Display rows per slot; 1 unless the diff is taller than the pane at
+    /// 1px per row, then ceil(total / pane_px).
+    group: usize,
+    runs: Vec<MinimapRun>,
+}
+
+fn minimap_scale(total: usize, pane_px: f32) -> (f32, usize) {
+    if total == 0 || pane_px <= 0. {
+        return (1., 1);
+    }
+    if total as f32 > pane_px {
+        (1., (total as f32 / pane_px).ceil() as usize)
+    } else {
+        ((pane_px / total as f32).clamp(1., 3.), 1)
+    }
+}
+
+/// The full minimap precompute: scale, downsample, and coalesce into quad
+/// runs. Per group and lane the highest-priority color wins and the width is
+/// the group's max fraction; vertically adjacent slots with the same lane,
+/// color, and width merge into one run. Recomputed only when the rows are
+/// rebuilt or the pane height changes — painting just iterates the runs.
+fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
+    let (slot_h, group) = minimap_scale(rows.len(), pane_px);
+    let mut runs: Vec<MinimapRun> = Vec::new();
+    // Per lane: index into `runs` of the run still open for extension.
+    let mut open: [Option<usize>; 3] = [None; 3];
+    for (slot, chunk) in rows.chunks(group).enumerate() {
+        let mut winner: [Option<MinimapColor>; 3] = [None; 3];
+        let mut frac: [f32; 3] = [0.; 3];
+        for row in chunk {
+            let mut fold = |lane: MinimapLane, color: MinimapColor, f: f32| {
+                let ix = lane as usize;
+                if winner[ix]
+                    .map_or(true, |best| minimap_priority(color) > minimap_priority(best))
+                {
+                    winner[ix] = Some(color);
+                }
+                frac[ix] = frac[ix].max(f);
+            };
+            match row.kind {
+                MinimapKind::Blank => {}
+                MinimapKind::Header => fold(MinimapLane::Full, MinimapColor::Header, 1.),
+                MinimapKind::Gap => fold(MinimapLane::Full, MinimapColor::Gap, 1.),
+                MinimapKind::Context => {
+                    fold(MinimapLane::Full, MinimapColor::Context, row.len_frac)
+                }
+                MinimapKind::Added => fold(MinimapLane::Full, MinimapColor::Added, row.len_frac),
+                MinimapKind::Removed => {
+                    fold(MinimapLane::Full, MinimapColor::Removed, row.len_frac)
+                }
+                MinimapKind::SplitPair {
+                    left_frac,
+                    right_frac,
+                    left,
+                    right,
+                } => {
+                    if left_frac > 0. || left {
+                        let color = if left {
+                            MinimapColor::Removed
+                        } else {
+                            MinimapColor::Context
+                        };
+                        fold(MinimapLane::Left, color, left_frac);
+                    }
+                    if right_frac > 0. || right {
+                        let color = if right {
+                            MinimapColor::Added
+                        } else {
+                            MinimapColor::Context
+                        };
+                        fold(MinimapLane::Right, color, right_frac);
+                    }
+                }
+            }
+        }
+        for ix in 0..3 {
+            let (Some(color), f) = (winner[ix], frac[ix]) else {
+                open[ix] = None;
+                continue;
+            };
+            // Zero-width bars (empty lines) paint nothing; they also break
+            // the run so bars on either side don't fuse across them.
+            if f <= 0. {
+                open[ix] = None;
+                continue;
+            }
+            // Header/gap ticks are 1px marks; when a slot is already 1px
+            // they're plain bars and coalesce like everything else.
+            let tick = matches!(color, MinimapColor::Header | MinimapColor::Gap) && slot_h > 1.;
+            if let Some(run_ix) = open[ix] {
+                let run = &mut runs[run_ix];
+                if !tick && !run.tick && run.color == color && run.frac == f {
+                    run.end += 1;
+                    continue;
+                }
+            }
+            open[ix] = (!tick).then_some(runs.len());
+            runs.push(MinimapRun {
+                start: slot as u32,
+                end: slot as u32 + 1,
+                lane: [MinimapLane::Full, MinimapLane::Left, MinimapLane::Right][ix],
+                color,
+                frac: f,
+                tick,
+            });
+        }
+    }
+    MinimapLayout { slot_h, group, runs }
+}
+
 // --- Sidebar file tree ---------------------------------------------------
 
 /// Row height of sidebar file-tree entries.
@@ -1285,6 +1540,11 @@ struct ItemData {
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
+    /// Minimap model, index-aligned with `rows`; rebuilt with them.
+    minimap: Vec<MinimapRow>,
+    /// Coalesced minimap quad runs for one pane height, computed lazily on
+    /// paint and reused until the height changes or the rows are rebuilt.
+    minimap_cache: RefCell<Option<(f32, Rc<MinimapLayout>)>>,
     cursor: usize,
     scroll: UniformListScrollHandle,
     additions: u32,
@@ -1312,6 +1572,30 @@ struct ItemData {
 }
 
 impl ItemData {
+    /// Install freshly built display rows, keeping the minimap model in sync
+    /// (every row rebuild goes through here).
+    fn set_rows(&mut self, (rows, file_rows, hunk_rows): (Vec<Row>, Vec<usize>, Vec<usize>)) {
+        self.minimap = minimap_rows(&rows);
+        self.minimap_cache.replace(None);
+        self.rows = rows;
+        self.file_rows = file_rows;
+        self.hunk_rows = hunk_rows;
+    }
+
+    /// The minimap quad runs for this pane height, from the cache when the
+    /// height hasn't changed since the last paint.
+    fn minimap_layout(&self, pane_px: f32) -> Rc<MinimapLayout> {
+        let mut cache = self.minimap_cache.borrow_mut();
+        if let Some((h, layout)) = &*cache {
+            if *h == pane_px {
+                return layout.clone();
+            }
+        }
+        let layout = Rc::new(minimap_runs(&self.minimap, pane_px));
+        *cache = Some((pane_px, layout.clone()));
+        layout
+    }
+
     /// Rebuild the sidebar file tree from the current diff, keeping collapse
     /// state for directories that still exist.
     fn rebuild_tree(&mut self) {
@@ -1416,9 +1700,7 @@ impl ReviewItem {
                     data.pr_meta = pr_meta;
                 }
                 data.diff = diff;
-                data.rows = rows;
-                data.file_rows = file_rows;
-                data.hunk_rows = hunk_rows;
+                data.set_rows((rows, file_rows, hunk_rows));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
                 data.deletions = deletions;
@@ -1426,6 +1708,7 @@ impl ReviewItem {
                 data.rebuild_tree();
             }
             _ => {
+                let minimap = minimap_rows(&rows);
                 let mut data = Box::new(ItemData {
                     pr_meta,
                     diff,
@@ -1433,6 +1716,8 @@ impl ReviewItem {
                     rows,
                     file_rows,
                     hunk_rows,
+                    minimap,
+                    minimap_cache: RefCell::new(None),
                     cursor: 0,
                     scroll: UniformListScrollHandle::new(),
                     additions,
@@ -1972,6 +2257,10 @@ struct ReviewApp {
     /// Where the current selection drag started (side locked at mouse-down);
     /// None when no drag is in progress.
     drag_anchor: Option<(SelSide, RowCol)>,
+    /// `m` toggles the minimap column for every item.
+    minimap_visible: bool,
+    /// A minimap scrub drag is in progress (mouse went down on the minimap).
+    minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
     char_width: Option<Pixels>,
     _subscriptions: Vec<Subscription>,
@@ -2038,6 +2327,8 @@ impl ReviewApp {
             palette_gen: 0,
             palette_scroll: UniformListScrollHandle::new(),
             drag_anchor: None,
+            minimap_visible: true,
+            minimap_scrub: false,
             char_width: None,
             _subscriptions,
         };
@@ -2256,11 +2547,7 @@ impl ReviewApp {
                     .files
                     .iter()
                     .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-                let (rows, file_rows, hunk_rows) =
-                    build_rows(&data.diff, data.mode, &data.upgrades);
-                data.rows = rows;
-                data.file_rows = file_rows;
-                data.hunk_rows = hunk_rows;
+                data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.selection = None;
                 // Paths can't change in an upgrade, but stats did; rebuilding
@@ -2294,10 +2581,7 @@ impl ReviewApp {
             Some(Row::Gap { hidden, .. }) => *hidden as usize - 1,
             _ => 0,
         };
-        let (rows, file_rows, hunk_rows) = build_rows(&data.diff, data.mode, &data.upgrades);
-        data.rows = rows;
-        data.file_rows = file_rows;
-        data.hunk_rows = hunk_rows;
+        data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
         data.selection = None;
         if let Some(gap_row) = gap_row {
             if data.cursor > gap_row {
@@ -2645,10 +2929,7 @@ impl ReviewApp {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        let (rows, file_rows, hunk_rows) = build_rows(&data.diff, data.mode, &data.upgrades);
-        data.rows = rows;
-        data.file_rows = file_rows;
-        data.hunk_rows = hunk_rows;
+        data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
         let target = file_pos
             .and_then(|pos| data.file_rows.get(pos).copied())
             .unwrap_or(0);
@@ -2724,6 +3005,138 @@ impl ReviewApp {
         if let Some(&ix) = targets.iter().rev().find(|&&ix| ix < cursor) {
             self.jump(ix, cx);
         }
+    }
+
+    /// Scrub the diff to the row under a minimap mouse position: invert the
+    /// minimap scale (downsample-aware) to a fractional row, then center it
+    /// by setting the scroll offset directly. Pure mouse math — verified
+    /// manually, like the selection hit test.
+    fn minimap_scrub_to(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data() else {
+            return;
+        };
+        let total = data.rows.len();
+        if total == 0 {
+            return;
+        }
+        let (bounds, offset) = {
+            let state = data.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        let pane_h = f32::from(bounds.size.height);
+        if pane_h <= 0. {
+            return;
+        }
+        // The minimap column is the same height as the list, so its y space
+        // starts at the list's top.
+        let (slot_h, group) = minimap_scale(total, pane_h);
+        let px_per_row = slot_h / group as f32;
+        let y = f32::from(position.y - bounds.top());
+        let row = (y / px_per_row).clamp(0., (total - 1) as f32);
+        let target = row * ROW_HEIGHT - (pane_h - ROW_HEIGHT) / 2.;
+        let max_scroll = (total as f32 * ROW_HEIGHT - pane_h).max(0.);
+        data.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(offset.x, px(-target.clamp(0., max_scroll))));
+        cx.notify();
+    }
+
+    /// The minimap column: precomputed, coalesced quad runs plus one
+    /// per-frame viewport rectangle, painted straight into a canvas (no text,
+    /// no per-row elements). Mouse-downs stop propagation here so the pane's
+    /// selection listeners never see them.
+    fn render_minimap(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let entity = cx.entity();
+        div()
+            .w(px(MINIMAP_WIDTH))
+            .h_full()
+            .flex_shrink_0()
+            .bg(Hsla::from(theme::crust()).opacity(0.5))
+            .border_l_1()
+            .border_color(theme::surface0())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    window.focus(&this.focus_handle);
+                    this.minimap_scrub = true;
+                    this.minimap_scrub_to(event.position, cx);
+                }),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let this = entity.read(cx);
+                        let Some(data) = this.active_data() else {
+                            return;
+                        };
+                        let total = data.rows.len();
+                        let pane_h = f32::from(bounds.size.height);
+                        if total == 0 || pane_h <= 0. {
+                            return;
+                        }
+                        let layout = data.minimap_layout(pane_h);
+                        let (x0, y0) = (f32::from(bounds.left()), f32::from(bounds.top()));
+                        let usable = f32::from(bounds.size.width) - 2. * MINIMAP_PAD;
+                        let half = (usable - MINIMAP_GAP) / 2.;
+                        for run in &layout.runs {
+                            let (x, w) = match run.lane {
+                                MinimapLane::Full => (0., usable * run.frac),
+                                MinimapLane::Left => (0., half * run.frac),
+                                MinimapLane::Right => (half + MINIMAP_GAP, half * run.frac),
+                            };
+                            let y = run.start as f32 * layout.slot_h;
+                            let h = if run.tick {
+                                1.
+                            } else {
+                                (run.end - run.start) as f32 * layout.slot_h
+                            };
+                            // Full alpha-ish tints: these are 1-3px bars and
+                            // need punch, unlike the row backgrounds.
+                            let color: Hsla = match run.color {
+                                MinimapColor::Added => Hsla::from(theme::green()).opacity(0.8),
+                                MinimapColor::Removed => Hsla::from(theme::red()).opacity(0.8),
+                                MinimapColor::Context => {
+                                    Hsla::from(theme::overlay0()).opacity(0.35)
+                                }
+                                MinimapColor::Header => Hsla::from(theme::blue()).opacity(0.5),
+                                MinimapColor::Gap => Hsla::from(theme::overlay0()).opacity(0.2),
+                            };
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    point(px(x0 + MINIMAP_PAD + x), px(y0 + y)),
+                                    size(px(w.max(1.)), px(h)),
+                                ),
+                                color,
+                            ));
+                        }
+                        // Viewport indicator — the only per-frame math.
+                        let offset_y =
+                            f32::from(-data.scroll.0.borrow().base_handle.offset().y);
+                        let px_per_row = layout.slot_h / layout.group as f32;
+                        let top_row = offset_y / ROW_HEIGHT;
+                        let visible = (pane_h / ROW_HEIGHT).min(total as f32 - top_row);
+                        let vy = top_row * px_per_row;
+                        let vh = (visible * px_per_row).max(3.);
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(
+                                    point(bounds.left(), px(y0 + vy)),
+                                    size(bounds.size.width, px(vh)),
+                                ),
+                                Hsla::from(theme::text()).opacity(0.08),
+                            )
+                            .border_widths(1.)
+                            .border_color(Hsla::from(theme::overlay0()).opacity(0.4)),
+                        );
+                    },
+                )
+                .size_full(),
+            )
+            .into_any_element()
     }
 
     fn render_titlebar(&self) -> impl IntoElement {
@@ -3220,6 +3633,7 @@ impl ReviewApp {
             .child(hint(&["]", "["], "files"))
             .child(hint(&["n", "p"], "hunks"))
             .child(hint(&["v"], "unified/split"))
+            .child(hint(&["m"], "minimap"))
             .child(hint(&["/"], "filter files"))
             .child(hint(&["home", "end"], "top/bottom"))
             .child(hint(&["cmd-k"], "palette"))
@@ -3252,6 +3666,7 @@ impl Render for ReviewApp {
                 ItemState::Ready(data) => div()
                     .size_full()
                     .relative()
+                    .flex()
                     .font_family(MONO)
                     .text_size(px(TEXT_SIZE))
                     .line_height(px(ROW_HEIGHT))
@@ -3283,6 +3698,13 @@ impl Render for ReviewApp {
                         if !event.dragging() {
                             return;
                         }
+                        // A scrub drag that started on the minimap keeps
+                        // scrubbing wherever the pointer goes; it never
+                        // becomes a text selection (drag_anchor stays None).
+                        if this.minimap_scrub {
+                            this.minimap_scrub_to(event.position, cx);
+                            return;
+                        }
                         let Some((side, anchor)) = this.drag_anchor else {
                             return;
                         };
@@ -3301,13 +3723,19 @@ impl Render for ReviewApp {
                     }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.drag_anchor = None),
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.drag_anchor = None;
+                            this.minimap_scrub = false;
+                        }),
                     )
                     // Releases outside the pane (drag ended over the sidebar,
                     // footer, …) must still end the drag.
                     .on_mouse_up_out(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseUpEvent, _, _| this.drag_anchor = None),
+                        cx.listener(|this, _: &MouseUpEvent, _, _| {
+                            this.drag_anchor = None;
+                            this.minimap_scrub = false;
+                        }),
                     )
                     .child(
                         uniform_list("diff", data.rows.len(), move |range, _window, cx| {
@@ -3335,8 +3763,16 @@ impl Render for ReviewApp {
                             ViewMode::Unified => ListHorizontalSizingBehavior::Unconstrained,
                             ViewMode::Split => ListHorizontalSizingBehavior::FitList,
                         })
-                        .h_full(),
+                        .h_full()
+                        .flex_1()
+                        .min_w_0(),
                     )
+                    // Between the list and the Scrollbar, which paints over
+                    // the column's right edge. Nothing is mounted when hidden
+                    // — zero cost.
+                    .when(self.minimap_visible, |pane| {
+                        pane.child(self.render_minimap(cx))
+                    })
                     .child(Scrollbar::new(&data.scroll))
                     .into_any_element(),
             },
@@ -3378,6 +3814,10 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleView, _, cx| this.toggle_view(cx)))
+            .on_action(cx.listener(|this, _: &ToggleMinimap, _, cx| {
+                this.minimap_visible = !this.minimap_visible;
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus. With the palette open, focus sits in the
@@ -4229,6 +4669,238 @@ mod tests {
         let rows = vec![line("let s = \"héllo\";")];
         let quoted = sel(SelSide::Unified, (0, 8), (0, 14));
         assert_eq!(selection_text(&quoted, &rows), "\"héllo");
+    }
+
+    // --- Minimap -----------------------------------------------------------
+
+    fn mrow(kind: MinimapKind, len_frac: f32) -> MinimapRow {
+        MinimapRow { kind, len_frac }
+    }
+
+    #[test]
+    fn minimap_rows_unified_kinds_and_fracs() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new());
+        let mm = minimap_rows(&rows);
+        assert_eq!(mm.len(), rows.len());
+        // FileHeader and HunkHeader both map to Header ticks.
+        assert_eq!(mm[0], mrow(MinimapKind::Header, 1.));
+        assert_eq!(mm[1], mrow(MinimapKind::Header, 1.));
+        // Line rows: kind from the row, frac = chars / MAX_MINIMAP_CHARS.
+        assert_eq!(mm[2], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
+        assert_eq!(mm[3], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
+        assert_eq!(mm[5], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
+        // Spacer and Binary rows are blank.
+        assert_eq!(mm[14], mrow(MinimapKind::Blank, 0.));
+        assert_eq!(mm[16], mrow(MinimapKind::Blank, 0.));
+    }
+
+    #[test]
+    fn minimap_rows_split_pairs_and_gaps() {
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new());
+        let mm = minimap_rows(&rows);
+        assert_eq!(mm.len(), rows.len());
+        // Context pair: both halves, no change flags.
+        assert_eq!(
+            mm[2].kind,
+            MinimapKind::SplitPair {
+                left_frac: 3. / 160.,
+                right_frac: 3. / 160.,
+                left: false,
+                right: false,
+            }
+        );
+        // Paired removed/added ("old1" / "new1").
+        assert_eq!(
+            mm[3].kind,
+            MinimapKind::SplitPair {
+                left_frac: 4. / 160.,
+                right_frac: 4. / 160.,
+                left: true,
+                right: true,
+            }
+        );
+        assert_eq!(mm[3].len_frac, 4. / 160.);
+        // One-sided rows: the absent half has a zero fraction and no flag.
+        let h2 = 6; // second HunkHeader (see split tests above)
+        assert_eq!(
+            mm[h2 + 2].kind,
+            MinimapKind::SplitPair {
+                left_frac: 2. / 160., // "r2"
+                right_frac: 0.,
+                left: true,
+                right: false,
+            }
+        );
+        assert_eq!(
+            mm[h2 + 4].kind,
+            MinimapKind::SplitPair {
+                left_frac: 0.,
+                right_frac: 4. / 160., // "lone"
+                left: false,
+                right: true,
+            }
+        );
+
+        // Gap rows map to Gap in both modes.
+        let (diff, upgrades) = upgraded_diff();
+        for mode in [ViewMode::Unified, ViewMode::Split] {
+            let (rows, _, _) = build_rows(&diff, mode, &upgrades);
+            let mm = minimap_rows(&rows);
+            assert_eq!(mm[1], mrow(MinimapKind::Gap, 1.));
+        }
+    }
+
+    #[test]
+    fn minimap_line_frac_caps() {
+        assert_eq!(line_frac(""), 0.);
+        assert_eq!(line_frac("abcd"), 4. / 160.);
+        assert_eq!(line_frac(&"x".repeat(1000)), 1.);
+    }
+
+    #[test]
+    fn minimap_scale_clamps_and_downsamples() {
+        // Tiny diff: 3px max per row, no grouping.
+        assert_eq!(minimap_scale(10, 300.), (3., 1));
+        // In between: pane / total, no grouping.
+        assert_eq!(minimap_scale(200, 300.), (1.5, 1));
+        assert_eq!(minimap_scale(300, 300.), (1., 1));
+        // Taller than the pane at 1px/row: group N = ceil(total / pane).
+        assert_eq!(minimap_scale(1000, 300.), (1., 4));
+        assert_eq!(minimap_scale(0, 300.), (1., 1));
+    }
+
+    #[test]
+    fn minimap_runs_coalesce_same_bars() {
+        let rows = vec![
+            mrow(MinimapKind::Added, 0.5),
+            mrow(MinimapKind::Added, 0.5),
+            mrow(MinimapKind::Added, 0.25), // different width: new run
+            mrow(MinimapKind::Context, 0.), // empty line: no bar, breaks the run
+            mrow(MinimapKind::Added, 0.5),
+        ];
+        let layout = minimap_runs(&rows, 100.);
+        assert_eq!((layout.slot_h, layout.group), (3., 1));
+        let expect = |start: u32, end: u32, color: MinimapColor, frac: f32| MinimapRun {
+            start,
+            end,
+            lane: MinimapLane::Full,
+            color,
+            frac,
+            tick: false,
+        };
+        assert_eq!(
+            layout.runs,
+            vec![
+                expect(0, 2, MinimapColor::Added, 0.5),
+                expect(2, 3, MinimapColor::Added, 0.25),
+                expect(4, 5, MinimapColor::Added, 0.5),
+            ]
+        );
+    }
+
+    #[test]
+    fn minimap_header_ticks_do_not_merge_unless_1px() {
+        let rows = vec![
+            mrow(MinimapKind::Header, 1.),
+            mrow(MinimapKind::Header, 1.),
+            mrow(MinimapKind::Context, 0.5),
+        ];
+        // 3px slots: adjacent headers stay separate 1px ticks.
+        let layout = minimap_runs(&rows, 100.);
+        assert_eq!(layout.slot_h, 3.);
+        assert_eq!(layout.runs.len(), 3);
+        assert!(layout.runs[0].tick && layout.runs[1].tick);
+        assert_eq!((layout.runs[0].start, layout.runs[0].end), (0, 1));
+        assert_eq!((layout.runs[1].start, layout.runs[1].end), (1, 2));
+        // 1px slots: ticks are plain bars and coalesce.
+        let layout = minimap_runs(&rows, 3.);
+        assert_eq!(layout.slot_h, 1.);
+        assert_eq!(layout.runs.len(), 2);
+        assert!(!layout.runs[0].tick);
+        assert_eq!((layout.runs[0].start, layout.runs[0].end), (0, 2));
+    }
+
+    #[test]
+    fn minimap_downsample_priority_and_max_frac() {
+        // 100 rows into a 10px pane: 10 rows per 1px slot.
+        let mut rows = vec![mrow(MinimapKind::Blank, 0.); 100];
+        rows[0] = mrow(MinimapKind::Removed, 0.1);
+        rows[1] = mrow(MinimapKind::Added, 1.);
+        rows[2] = mrow(MinimapKind::Context, 0.2);
+        for slot in rows[10..20].iter_mut() {
+            *slot = mrow(MinimapKind::Context, 0.2);
+        }
+        let layout = minimap_runs(&rows, 10.);
+        assert_eq!((layout.slot_h, layout.group), (1., 10));
+        // Slot 0: Removed outranks Added/Context; width is the group max.
+        // Slot 1: all-context. Slots 2..: blank, nothing painted.
+        assert_eq!(
+            layout.runs,
+            vec![
+                MinimapRun {
+                    start: 0,
+                    end: 1,
+                    lane: MinimapLane::Full,
+                    color: MinimapColor::Removed,
+                    frac: 1.,
+                    tick: false,
+                },
+                MinimapRun {
+                    start: 1,
+                    end: 2,
+                    lane: MinimapLane::Full,
+                    color: MinimapColor::Context,
+                    frac: 0.2,
+                    tick: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn minimap_split_rows_use_half_lanes() {
+        let pair = |left_frac: f32, right_frac: f32, left: bool, right: bool| {
+            mrow(
+                MinimapKind::SplitPair { left_frac, right_frac, left, right },
+                left_frac.max(right_frac),
+            )
+        };
+        let rows = vec![
+            pair(0.5, 0.25, true, true),
+            pair(0.5, 0.25, true, true),
+            pair(0.5, 0., false, false), // context left, absent right
+        ];
+        let layout = minimap_runs(&rows, 90.);
+        assert_eq!(layout.slot_h, 3.);
+        assert_eq!(
+            layout.runs,
+            vec![
+                MinimapRun {
+                    start: 0,
+                    end: 2,
+                    lane: MinimapLane::Left,
+                    color: MinimapColor::Removed,
+                    frac: 0.5,
+                    tick: false,
+                },
+                MinimapRun {
+                    start: 0,
+                    end: 2,
+                    lane: MinimapLane::Right,
+                    color: MinimapColor::Added,
+                    frac: 0.25,
+                    tick: false,
+                },
+                MinimapRun {
+                    start: 2,
+                    end: 3,
+                    lane: MinimapLane::Left,
+                    color: MinimapColor::Context,
+                    frac: 0.5,
+                    tick: false,
+                },
+            ]
+        );
     }
 
     #[test]
