@@ -154,6 +154,96 @@ pub fn list_prs(owner: &str, repo: &str) -> Result<Vec<PrSummary>> {
     serde_json::from_str(&json).context("unexpected gh pr list JSON")
 }
 
+/// One PR review comment from the REST pulls/comments API. Unlike `gh pr
+/// view --json` (camelCase), this endpoint returns snake_case field names, so
+/// no `rename_all` here.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ReviewComment {
+    pub id: u64,
+    pub path: String,
+    /// Anchor line on `side` against the *current* diff; None = outdated
+    /// (the code the comment was written against has since changed).
+    pub line: Option<u64>,
+    /// "RIGHT" (new side) or "LEFT" (old side).
+    pub side: Option<String>,
+    /// Multi-line comments start here and anchor at `line` (the end), like
+    /// GitHub's own UI.
+    pub start_line: Option<u64>,
+    pub body: String,
+    pub user: Author,
+    pub created_at: String,
+    pub in_reply_to_id: Option<u64>,
+}
+
+/// Every review comment on the PR. `--paginate --slurp` (gh ≥ 2.66; we
+/// require it) wraps each page's JSON array into one array-of-arrays —
+/// without `--slurp`, `--paginate` concatenates the arrays back-to-back
+/// ("[…][…]"), which serde can't parse.
+pub fn fetch_review_comments(loc: &PrLocator) -> Result<Vec<ReviewComment>> {
+    let json = gh(&[
+        "api",
+        "--paginate",
+        "--slurp",
+        &format!(
+            "repos/{}/{}/pulls/{}/comments?per_page=100",
+            loc.owner, loc.repo, loc.number
+        ),
+    ])?;
+    let pages: Vec<Vec<ReviewComment>> =
+        serde_json::from_str(&json).context("unexpected gh pulls/comments JSON")?;
+    Ok(pages.into_iter().flatten().collect())
+}
+
+/// Post a new top-level review comment anchored at (path, side, line) against
+/// `commit_id` (the PR's head oid). Errors carry gh's stderr — a 403 usually
+/// means a missing token scope, a 422 an unanchorable line.
+pub fn post_review_comment(
+    loc: &PrLocator,
+    commit_id: &str,
+    path: &str,
+    side: &str,
+    line: u64,
+    body: &str,
+) -> Result<()> {
+    gh(&[
+        "api",
+        "-X",
+        "POST",
+        &format!(
+            "repos/{}/{}/pulls/{}/comments",
+            loc.owner, loc.repo, loc.number
+        ),
+        "-f",
+        &format!("body={body}"),
+        "-f",
+        &format!("commit_id={commit_id}"),
+        "-f",
+        &format!("path={path}"),
+        "-f",
+        &format!("side={side}"),
+        // -F, not -f: line must be a JSON integer, not a string.
+        "-F",
+        &format!("line={line}"),
+    ])?;
+    Ok(())
+}
+
+/// Reply to the review thread rooted at `comment_id`.
+pub fn post_reply(loc: &PrLocator, comment_id: u64, body: &str) -> Result<()> {
+    gh(&[
+        "api",
+        "-X",
+        "POST",
+        &format!(
+            "repos/{}/{}/pulls/{}/comments/{}/replies",
+            loc.owner, loc.repo, loc.number, comment_id
+        ),
+        "-f",
+        &format!("body={body}"),
+    ])?;
+    Ok(())
+}
+
 pub fn fetch_patch(loc: &PrLocator) -> Result<String> {
     gh(&[
         "pr",
@@ -347,6 +437,68 @@ mod tests {
         let meta: PrMeta = serde_json::from_str(json).unwrap();
         assert_eq!(meta.base_ref_oid, "abc123");
         assert_eq!(meta.head_ref_oid, "def456");
+    }
+
+    #[test]
+    fn deserializes_review_comments() {
+        // Shaped like `gh api --paginate --slurp`: one array per page. The
+        // REST payload is snake_case and carries fields we ignore.
+        let json = r#"[[
+            {
+                "id": 100,
+                "node_id": "x",
+                "path": "src/main.rs",
+                "line": 42,
+                "side": "RIGHT",
+                "start_line": 40,
+                "start_side": "RIGHT",
+                "body": "top-level comment",
+                "user": {"login": "alice", "id": 1},
+                "created_at": "2026-07-01T12:00:00Z",
+                "in_reply_to_id": null
+            },
+            {
+                "id": 101,
+                "path": "src/main.rs",
+                "line": 42,
+                "side": "RIGHT",
+                "start_line": null,
+                "body": "a reply",
+                "user": {"login": "bob"},
+                "created_at": "2026-07-02T08:30:00Z",
+                "in_reply_to_id": 100
+            }
+        ], [
+            {
+                "id": 102,
+                "path": "old.rs",
+                "line": null,
+                "side": null,
+                "start_line": null,
+                "body": "outdated",
+                "user": {"login": "carol"},
+                "created_at": "2026-06-01T00:00:00Z"
+            }
+        ]]"#;
+        let pages: Vec<Vec<ReviewComment>> = serde_json::from_str(json).unwrap();
+        let comments: Vec<ReviewComment> = pages.into_iter().flatten().collect();
+        assert_eq!(comments.len(), 3);
+        let top = &comments[0];
+        assert_eq!(top.id, 100);
+        assert_eq!(top.path, "src/main.rs");
+        assert_eq!(top.line, Some(42));
+        assert_eq!(top.side.as_deref(), Some("RIGHT"));
+        assert_eq!(top.start_line, Some(40));
+        assert_eq!(top.user.login, "alice");
+        assert_eq!(top.in_reply_to_id, None);
+        let reply = &comments[1];
+        assert_eq!(reply.in_reply_to_id, Some(100));
+        assert_eq!(reply.start_line, None);
+        // Outdated: null line/side, and a missing in_reply_to_id key.
+        let outdated = &comments[2];
+        assert_eq!(outdated.line, None);
+        assert_eq!(outdated.side, None);
+        assert_eq!(outdated.in_reply_to_id, None);
     }
 
     #[test]

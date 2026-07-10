@@ -19,7 +19,7 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    IconName, Root, Sizable as _, TitleBar,
+    Disableable as _, IconName, Root, Sizable as _, TitleBar,
 };
 use std::ops::Range;
 use std::path::Path;
@@ -40,7 +40,8 @@ actions!(
     [
         NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
         ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
-        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap
+        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap,
+        ToggleComments
     ]
 );
 
@@ -84,6 +85,7 @@ fn main() {
                 KeyBinding::new("end", GoToBottom, Some("ReviewApp")),
                 KeyBinding::new("v", ToggleView, Some("ReviewApp")),
                 KeyBinding::new("m", ToggleMinimap, Some("ReviewApp")),
+                KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 // Only while the diff pane has focus; typing `/` in any input
                 // stays a plain character.
@@ -165,6 +167,11 @@ enum Row {
         status: FileStatus,
         additions: u32,
         deletions: u32,
+        /// Review comments anchored in this file / outdated (unanchorable)
+        /// ones. Shown as a dim count when nonzero; always populated for PR
+        /// items even while comment rows are toggled off.
+        comments: usize,
+        outdated: usize,
     },
     HunkHeader {
         label: SharedString,
@@ -193,6 +200,262 @@ enum Row {
         left: Option<Cell>,
         right: Option<Cell>,
     },
+    /// First row of one review comment: author + age. Selectable-through
+    /// like headers, spans full width in both view modes.
+    CommentHeader {
+        author: SharedString,
+        when: SharedString,
+        is_reply: bool,
+    },
+    /// One soft-wrapped line of a comment body (wrapped at
+    /// [`COMMENT_WRAP_CHARS`] when the rows are built).
+    CommentBody { line: SharedString },
+    /// The "↳ reply" affordance closing a thread; clicking opens the
+    /// composer targeting `post_reply` on the thread's root comment.
+    CommentActions {
+        root_id: u64,
+        path: SharedString,
+        side: CommentSide,
+        line: u64,
+    },
+}
+
+fn is_comment_row(row: &Row) -> bool {
+    matches!(
+        row,
+        Row::CommentHeader { .. } | Row::CommentBody { .. } | Row::CommentActions { .. }
+    )
+}
+
+/// Index of the `n`-th non-comment row (0-based), clamped to the last row.
+/// Comment rows are pure insertions relative to the diff rows, so this maps
+/// a position across rebuilds that only add or remove comment rows.
+fn nth_noncomment_row(rows: &[Row], n: usize) -> usize {
+    let mut seen = 0;
+    for (ix, row) in rows.iter().enumerate() {
+        if !is_comment_row(row) {
+            if seen == n {
+                return ix;
+            }
+            seen += 1;
+        }
+    }
+    rows.len().saturating_sub(1)
+}
+
+// --- Review comments -------------------------------------------------------
+
+/// Which diff side a review comment anchors to, GitHub's LEFT/RIGHT.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum CommentSide {
+    Left,
+    Right,
+}
+
+impl CommentSide {
+    fn api_str(self) -> &'static str {
+        match self {
+            CommentSide::Left => "LEFT",
+            CommentSide::Right => "RIGHT",
+        }
+    }
+}
+
+/// One review thread: the top-level comment plus its replies, in
+/// created_at order.
+#[derive(Debug)]
+struct CommentThread {
+    root: gh::ReviewComment,
+    replies: Vec<gh::ReviewComment>,
+}
+
+/// One file's threads, keyed by anchor.
+type FileAnchors = HashMap<(CommentSide, u64), Vec<CommentThread>>;
+
+/// All review comments of a PR, grouped for row building.
+#[derive(Debug, Default)]
+struct CommentIndex {
+    /// path → (side, line) → threads in root-created order.
+    threads: HashMap<String, FileAnchors>,
+    /// path → (anchored comment count, outdated comment count).
+    counts: HashMap<String, (usize, usize)>,
+}
+
+/// Group flat REST comments into anchored threads: replies attach to their
+/// thread via `in_reply_to_id` (orphans are dropped), threads whose root has
+/// no current line are only counted as outdated.
+fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
+    // ISO-8601 UTC strings sort lexicographically = chronologically, so this
+    // orders roots before their replies and threads by root creation.
+    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    let mut threads: Vec<CommentThread> = Vec::new();
+    // Comment id (root or reply) → thread index, so replies-to-replies still
+    // land in the right thread.
+    let mut thread_of: HashMap<u64, usize> = HashMap::new();
+    for comment in comments {
+        match comment.in_reply_to_id {
+            None => {
+                thread_of.insert(comment.id, threads.len());
+                threads.push(CommentThread {
+                    root: comment,
+                    replies: Vec::new(),
+                });
+            }
+            Some(parent) => {
+                if let Some(&ix) = thread_of.get(&parent) {
+                    thread_of.insert(comment.id, ix);
+                    threads[ix].replies.push(comment);
+                }
+                // Orphaned reply (parent not fetched): skip.
+            }
+        }
+    }
+    let mut index = CommentIndex::default();
+    for thread in threads {
+        let size = 1 + thread.replies.len();
+        let counts = index.counts.entry(thread.root.path.clone()).or_default();
+        let Some(line) = thread.root.line else {
+            counts.1 += size;
+            continue;
+        };
+        counts.0 += size;
+        let side = if thread.root.side.as_deref() == Some("LEFT") {
+            CommentSide::Left
+        } else {
+            CommentSide::Right
+        };
+        index
+            .threads
+            .entry(thread.root.path.clone())
+            .or_default()
+            .entry((side, line))
+            .or_default()
+            .push(thread);
+    }
+    index
+}
+
+/// Comment bodies soft-wrap at this many chars (the pane is monospace).
+const COMMENT_WRAP_CHARS: usize = 100;
+
+/// Soft-wrap `text` at `width` chars: explicit newlines are preserved, wraps
+/// prefer the last space in range (the space is consumed), and a word longer
+/// than the width hard-breaks on a char boundary.
+fn wrap_body(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.split('\n') {
+        let mut line = line.strip_suffix('\r').unwrap_or(line);
+        loop {
+            // Byte offset of the (width+1)-th char; absent = the rest fits.
+            let Some((cut, _)) = line.char_indices().nth(width) else {
+                out.push(line.to_string());
+                break;
+            };
+            match line[..cut].rfind(' ') {
+                Some(space) if space > 0 => {
+                    out.push(line[..space].to_string());
+                    line = &line[space + 1..];
+                }
+                _ => {
+                    out.push(line[..cut].to_string());
+                    line = &line[cut..];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Unix seconds for an ISO-8601 UTC timestamp ("2026-07-01T12:34:56Z").
+fn parse_iso_utc(s: &str) -> Option<i64> {
+    if s.len() < 20 {
+        return None;
+    }
+    let num = |range: Range<usize>| s.get(range)?.parse::<i64>().ok();
+    Some(
+        days_from_civil(num(0..4)?, num(5..7)?, num(8..10)?) * 86400
+            + num(11..13)? * 3600
+            + num(14..16)? * 60
+            + num(17..19)?,
+    )
+}
+
+/// Compact "3d ago"-style age of an ISO timestamp relative to `now` (unix
+/// seconds). Unparseable input renders as-is.
+fn short_age(iso: &str, now: i64) -> String {
+    let Some(t) = parse_iso_utc(iso) else {
+        return iso.to_string();
+    };
+    let d = now - t;
+    if d < 60 {
+        "just now".to_string()
+    } else if d < 3600 {
+        format!("{}m ago", d / 60)
+    } else if d < 86400 {
+        format!("{}h ago", d / 3600)
+    } else if d < 365 * 86400 {
+        format!("{}d ago", d / 86400)
+    } else {
+        format!("{}y ago", d / (365 * 86400))
+    }
+}
+
+/// Append the display rows of every thread anchored at (side, no) — comment
+/// headers, wrapped body lines, and one reply-affordance row per thread.
+/// No-op when comments are hidden/absent (`anchors` None) or the row has no
+/// number on that side.
+fn push_thread_rows(
+    rows: &mut Vec<Row>,
+    anchors: Option<&FileAnchors>,
+    path: &str,
+    side: CommentSide,
+    no: Option<u32>,
+    now: i64,
+) {
+    let (Some(anchors), Some(no)) = (anchors, no) else {
+        return;
+    };
+    let Some(threads) = anchors.get(&(side, no as u64)) else {
+        return;
+    };
+    for thread in threads {
+        for (ix, comment) in std::iter::once(&thread.root)
+            .chain(&thread.replies)
+            .enumerate()
+        {
+            rows.push(Row::CommentHeader {
+                author: comment.user.login.clone().into(),
+                when: short_age(&comment.created_at, now).into(),
+                is_reply: ix > 0,
+            });
+            for line in wrap_body(&comment.body, COMMENT_WRAP_CHARS) {
+                rows.push(Row::CommentBody { line: line.into() });
+            }
+        }
+        rows.push(Row::CommentActions {
+            root_id: thread.root.id,
+            path: path.to_string().into(),
+            side,
+            line: no as u64,
+        });
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Which text stream a selection runs through. Split selections are locked to
@@ -423,6 +686,9 @@ fn push_gap_rows(
     file_ix: usize,
     gap_ix: usize,
     mode: ViewMode,
+    path: &str,
+    anchors: Option<&FileAnchors>,
+    now: i64,
 ) {
     let (old_lo, new_lo, count) = gap_span(hunks, gap_ix, upgrade.new_lines.len() as u32);
     if count == 0 {
@@ -474,6 +740,8 @@ fn push_gap_rows(
                 }),
             },
         });
+        push_thread_rows(rows, anchors, path, CommentSide::Left, Some(old_no), now);
+        push_thread_rows(rows, anchors, path, CommentSide::Right, Some(new_no), now);
     }
 }
 
@@ -481,23 +749,38 @@ fn push_gap_rows(
 /// hunk headers. Split mode pairs removed/added runs positionally into
 /// two-cell rows; unequal runs leave one-sided rows. Files present in
 /// `upgrades` use whole-file syntax spans and get gap rows between hunks.
+/// Review threads (PR items) render beneath the line they anchor to when
+/// `show_comments` is set; file headers always carry the comment counts.
 fn build_rows(
     diff: &PrDiff,
     mode: ViewMode,
     upgrades: &HashMap<usize, FileUpgrade>,
+    comments: Option<&CommentIndex>,
+    show_comments: bool,
 ) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
     let mut hunk_rows = Vec::new();
+    let now = now_unix();
 
     for (file_ix, file) in diff.files.iter().enumerate() {
         let upgrade = upgrades.get(&file_ix);
+        let path = file.display_path();
+        let (n_comments, n_outdated) = comments
+            .and_then(|index| index.counts.get(path))
+            .copied()
+            .unwrap_or((0, 0));
+        let anchors = if show_comments {
+            comments.and_then(|index| index.threads.get(path))
+        } else {
+            None
+        };
         if !rows.is_empty() {
             rows.push(Row::Spacer);
         }
         file_rows.push(rows.len());
         rows.push(Row::FileHeader {
-            path: file.display_path().to_string().into(),
+            path: path.to_string().into(),
             old_path: match file.status {
                 FileStatus::Renamed => file.old_path.clone().map(Into::into),
                 _ => None,
@@ -505,15 +788,19 @@ fn build_rows(
             status: file.status,
             additions: file.additions,
             deletions: file.deletions,
+            comments: n_comments,
+            outdated: n_outdated,
         });
         if file.status == FileStatus::Binary {
             rows.push(Row::Binary);
             continue;
         }
-        let lang = syntax::language_for_path(file.display_path());
+        let lang = syntax::language_for_path(path);
         for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
             if let Some(upgrade) = upgrade {
-                push_gap_rows(&mut rows, upgrade, &file.hunks, file_ix, hunk_ix, mode);
+                push_gap_rows(
+                    &mut rows, upgrade, &file.hunks, file_ix, hunk_ix, mode, path, anchors, now,
+                );
             }
             let syntax_spans = match upgrade {
                 Some(upgrade) => hunk.rows.iter().map(|row| upgrade.row_spans(row)).collect(),
@@ -536,6 +823,13 @@ fn build_rows(
                 ViewMode::Unified => {
                     for (ix, row) in hunk.rows.iter().enumerate() {
                         let syntax = syntax_spans[ix].clone();
+                        let (old_no, new_no) = match row {
+                            DiffRow::Context { old_no, new_no, .. } => {
+                                (Some(*old_no), Some(*new_no))
+                            }
+                            DiffRow::Added { new_no, .. } => (None, Some(*new_no)),
+                            DiffRow::Removed { old_no, .. } => (Some(*old_no), None),
+                        };
                         rows.push(match row {
                             DiffRow::Context {
                                 old_no,
@@ -574,6 +868,8 @@ fn build_rows(
                                 syntax,
                             },
                         });
+                        push_thread_rows(&mut rows, anchors, path, CommentSide::Left, old_no, now);
+                        push_thread_rows(&mut rows, anchors, path, CommentSide::Right, new_no, now);
                     }
                 }
                 ViewMode::Split => {
@@ -608,6 +904,14 @@ fn build_rows(
                                         syntax,
                                     }),
                                 });
+                                push_thread_rows(
+                                    &mut rows, anchors, path,
+                                    CommentSide::Left, Some(*old_no), now,
+                                );
+                                push_thread_rows(
+                                    &mut rows, anchors, path,
+                                    CommentSide::Right, Some(*new_no), now,
+                                );
                                 i += 1;
                             }
                             DiffRow::Added {
@@ -626,6 +930,10 @@ fn build_rows(
                                         syntax: syntax_spans[i].clone(),
                                     }),
                                 });
+                                push_thread_rows(
+                                    &mut rows, anchors, path,
+                                    CommentSide::Right, Some(*new_no), now,
+                                );
                                 i += 1;
                             }
                             DiffRow::Removed { .. } => {
@@ -674,7 +982,17 @@ fn build_rows(
                                             _ => unreachable!(),
                                         }
                                     });
+                                    let left_no = left.as_ref().map(|cell| cell.no);
+                                    let right_no = right.as_ref().map(|cell| cell.no);
                                     rows.push(Row::SplitLine { left, right });
+                                    push_thread_rows(
+                                        &mut rows, anchors, path,
+                                        CommentSide::Left, left_no, now,
+                                    );
+                                    push_thread_rows(
+                                        &mut rows, anchors, path,
+                                        CommentSide::Right, right_no, now,
+                                    );
                                 }
                             }
                         }
@@ -683,7 +1001,10 @@ fn build_rows(
             }
         }
         if let Some(upgrade) = upgrade {
-            push_gap_rows(&mut rows, upgrade, &file.hunks, file_ix, file.hunks.len(), mode);
+            push_gap_rows(
+                &mut rows, upgrade, &file.hunks, file_ix, file.hunks.len(), mode, path, anchors,
+                now,
+            );
         }
     }
 
@@ -793,17 +1114,113 @@ fn line_content(
     }
 }
 
+/// Shared shape of every comment row: indented card with a mantle background
+/// and a blue left accent, spanning full width in both view modes.
+fn comment_row(inner: gpui::AnyElement) -> gpui::AnyElement {
+    div()
+        .h(px(ROW_HEIGHT))
+        .w_full()
+        .flex()
+        .child(div().w(px(72.)).flex_shrink_0())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .bg(theme::mantle())
+                .border_l_2()
+                .border_color(theme::blue())
+                .px_3()
+                .flex()
+                .items_center()
+                .overflow_hidden()
+                .child(inner),
+        )
+        .into_any_element()
+}
+
 /// `selection` is this row's selected byte range (side + non-empty range),
 /// computed by the caller via `row_selection_range`; its side always matches
 /// the row shape (Unified for Line rows, Left/Right for SplitLine rows).
-/// `entity` is only used by Gap rows, whose click expands the gap.
+/// `entity` is used by Gap rows (click expands) and CommentActions rows
+/// (click opens the reply composer); `ix` is the display-row index.
 fn render_row(
+    ix: usize,
     row: &Row,
     selection: Option<(SelSide, Range<usize>)>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
     let row_height = px(ROW_HEIGHT);
     match row {
+        Row::CommentHeader {
+            author,
+            when,
+            is_reply,
+        } => {
+            let mut inner = div().flex().items_center().gap_2().min_w_0();
+            if *is_reply {
+                inner = inner.child(
+                    div()
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from("↳")),
+                );
+            }
+            comment_row(
+                inner
+                    .child(
+                        div()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme::text())
+                            .child(author.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme::overlay0())
+                            .text_size(px(11.))
+                            .child(when.clone()),
+                    )
+                    .into_any_element(),
+            )
+        }
+        Row::CommentBody { line } => comment_row(
+            div()
+                .whitespace_nowrap()
+                .text_color(theme::subtext())
+                .child(line.clone())
+                .into_any_element(),
+        ),
+        Row::CommentActions {
+            root_id,
+            path,
+            side,
+            line,
+        } => {
+            let (root_id, side, line) = (*root_id, *side, *line);
+            let path = path.clone();
+            let entity = entity.clone();
+            comment_row(
+                div()
+                    .id(("reply", root_id as usize))
+                    .cursor_pointer()
+                    .text_color(theme::blue())
+                    .hover(|style| style.opacity(0.8))
+                    .child(SharedString::from("↳ reply"))
+                    .on_click(move |_, window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.open_composer(
+                                Some(root_id),
+                                path.to_string(),
+                                side,
+                                line,
+                                ix,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
+                    .into_any_element(),
+            )
+        }
         Row::Spacer => div().h(row_height).into_any_element(),
         Row::Gap {
             file_ix,
@@ -836,6 +1253,8 @@ fn render_row(
             status,
             additions,
             deletions,
+            comments,
+            outdated,
         } => {
             let (status_label, status_color) = status_style(*status);
             let status: Hsla = status_color.into();
@@ -863,6 +1282,24 @@ fn render_row(
                     div()
                         .text_color(theme::overlay0())
                         .child(SharedString::from(format!("← {old_path}"))),
+                );
+            }
+            if *comments > 0 || *outdated > 0 {
+                let mut note = String::new();
+                if *comments > 0 {
+                    note = format!("{comments} comment{}", if *comments == 1 { "" } else { "s" });
+                }
+                if *outdated > 0 {
+                    if !note.is_empty() {
+                        note.push_str(" · ");
+                    }
+                    note.push_str(&format!("{outdated} outdated"));
+                }
+                header = header.child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(note)),
                 );
             }
             header
@@ -1072,7 +1509,13 @@ fn line_frac(text: &str) -> f32 {
 fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
     rows.iter()
         .map(|row| match row {
-            Row::Spacer | Row::Binary => MinimapRow {
+            // Comment rows stay blank in the minimap: threads are short and
+            // already flagged by the file-header counts.
+            Row::Spacer
+            | Row::Binary
+            | Row::CommentHeader { .. }
+            | Row::CommentBody { .. }
+            | Row::CommentActions { .. } => MinimapRow {
                 kind: MinimapKind::Blank,
                 len_frac: 0.,
             },
@@ -1557,6 +2000,11 @@ struct ItemData {
     /// tables, full new-side lines, and expanded gaps. The re-diffed hunks
     /// themselves replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
+    /// Review threads grouped by anchor; Some for PR items (possibly empty),
+    /// None for local items, which have no comment affordances at all.
+    comments: Option<CommentIndex>,
+    /// `c` toggles the comment rows; the file-header counts always show.
+    comments_visible: bool,
     /// Sidebar file tree, rebuilt whenever the diff itself changes (load,
     /// refresh, blob upgrade) — but not on view-mode toggles: entries map to
     /// file indices, not row indices, so they survive row rebuilds.
@@ -1580,6 +2028,36 @@ impl ItemData {
         self.rows = rows;
         self.file_rows = file_rows;
         self.hunk_rows = hunk_rows;
+    }
+
+    /// Rebuild the display rows after only the comment rows changed
+    /// (visibility toggle, comment refetch), keeping the viewport anchored:
+    /// the first visible non-comment row stays put even though comment rows
+    /// above it appeared or disappeared.
+    fn rebuild_rows_anchored(&mut self) {
+        let offset = self.scroll.0.borrow().base_handle.offset();
+        let top_px = f32::from(-offset.y).max(0.);
+        let top_row =
+            ((top_px / ROW_HEIGHT).floor() as usize).min(self.rows.len().saturating_sub(1));
+        let frac = top_px - top_row as f32 * ROW_HEIGHT;
+        let count_noncomment =
+            |rows: &[Row]| rows.iter().filter(|row| !is_comment_row(row)).count();
+        let top_base = count_noncomment(&self.rows[..top_row]);
+        let cursor_base = count_noncomment(&self.rows[..self.cursor.min(self.rows.len())]);
+        self.set_rows(build_rows(
+            &self.diff,
+            self.mode,
+            &self.upgrades,
+            self.comments.as_ref(),
+            self.comments_visible,
+        ));
+        self.selection = None;
+        self.cursor = nth_noncomment_row(&self.rows, cursor_base);
+        let new_top = nth_noncomment_row(&self.rows, top_base);
+        self.scroll.0.borrow().base_handle.set_offset(point(
+            offset.x,
+            px(-(new_top as f32 * ROW_HEIGHT + frac)),
+        ));
     }
 
     /// The minimap quad runs for this pane height, from the cache when the
@@ -1673,6 +2151,7 @@ impl ReviewItem {
             mut file_rows,
             mut hunk_rows,
             mode,
+            comments,
         } = loaded;
         let (additions, deletions) = diff
             .files
@@ -1692,9 +2171,17 @@ impl ReviewItem {
                 // Fresh patch-derived data: any previous upgrade (and its
                 // expanded gaps) is stale — the upgrade re-runs from scratch.
                 data.upgrades.clear();
-                if data.mode != mode {
-                    // The user toggled unified/split while the refresh ran.
-                    (rows, file_rows, hunk_rows) = build_rows(&diff, data.mode, &data.upgrades);
+                data.comments = comments;
+                if data.mode != mode || !data.comments_visible {
+                    // The user toggled unified/split (or hid comments) while
+                    // the refresh ran; the background rows assumed otherwise.
+                    (rows, file_rows, hunk_rows) = build_rows(
+                        &diff,
+                        data.mode,
+                        &data.upgrades,
+                        data.comments.as_ref(),
+                        data.comments_visible,
+                    );
                 }
                 if pr_meta.is_some() {
                     data.pr_meta = pr_meta;
@@ -1724,6 +2211,8 @@ impl ReviewItem {
                     deletions,
                     selection: None,
                     upgrades: HashMap::new(),
+                    comments,
+                    comments_visible: true,
                     tree: Vec::new(),
                     collapsed: HashSet::new(),
                     tree_scroll: UniformListScrollHandle::new(),
@@ -1754,29 +2243,38 @@ struct Loaded {
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
     mode: ViewMode,
+    /// Some (possibly empty) for PR items, None for local ones.
+    comments: Option<CommentIndex>,
 }
 
 /// Blocking fetch + parse + row building for one item; runs on the background
 /// executor, so subprocess waits and tree-sitter work stay off the main thread.
+/// PR items fetch meta, patch, and review comments concurrently.
 fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
-    let (meta, patch) = match source {
+    let (meta, patch, comments) = match source {
         Source::Pr(loc) => {
             let meta_loc = loc.clone();
             let meta_thread = std::thread::spawn(move || gh::fetch_meta(&meta_loc));
+            let comments_loc = loc.clone();
+            let comments_thread =
+                std::thread::spawn(move || gh::fetch_review_comments(&comments_loc));
             let patch = gh::fetch_patch(loc)?;
             let meta = meta_thread
                 .join()
                 .map_err(|_| anyhow!("gh metadata fetch panicked"))??;
-            (LoadedMeta::Pr(meta), patch)
+            let comments = comments_thread
+                .join()
+                .map_err(|_| anyhow!("gh comments fetch panicked"))??;
+            (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
         }
         Source::Local(src) => {
             let src = git::resolve_local(&src.repo_root)?;
             let patch = git::diff_patch(&src)?;
-            (LoadedMeta::Local(src), patch)
+            (LoadedMeta::Local(src), patch, None)
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new());
+    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
     Ok(Loaded {
         meta,
         diff,
@@ -1784,6 +2282,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         file_rows,
         hunk_rows,
         mode,
+        comments,
     })
 }
 
@@ -2238,6 +2737,27 @@ fn parse_repo_slug(value: &str) -> Result<(String, String), &'static str> {
     Ok((owner.to_string(), repo.to_string()))
 }
 
+/// The floating comment/reply composer. One at a time, targeting a specific
+/// anchor of a specific item (it survives item switches but only renders —
+/// and can only post — for the item it was opened on).
+struct Composer {
+    item_id: u64,
+    /// Some(root comment id) = reply to that thread; None = new top-level
+    /// comment at (path, side, line) against `commit_id`.
+    reply_to: Option<u64>,
+    commit_id: String,
+    path: String,
+    side: CommentSide,
+    line: u64,
+    /// Display row the composer is anchored beneath (best effort; goes stale
+    /// harmlessly if rows rebuild while it is open).
+    row_ix: usize,
+    input: gpui::Entity<InputState>,
+    error: Option<SharedString>,
+    in_flight: bool,
+    _subscription: Subscription,
+}
+
 struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -2263,7 +2783,40 @@ struct ReviewApp {
     minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
     char_width: Option<Pixels>,
+    /// Diff row + split half under the pointer where a hover "+" (new
+    /// comment) affordance shows; None when the pointer isn't on a
+    /// commentable line of a PR item.
+    hover_plus: Option<(usize, SelSide)>,
+    composer: Option<Composer>,
+    /// Bumped on every composer open/close; an in-flight post only reports
+    /// back into the composer generation it was submitted from.
+    composer_gen: u64,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The comment anchor of a display row: which (side, line) a new comment on
+/// it targets. Unified rows anchor by kind (Removed → LEFT, else RIGHT);
+/// split rows by the half under the pointer. Rows without line numbers and
+/// absent cells yield None.
+fn comment_anchor(rows: &[Row], row_ix: usize, side: SelSide) -> Option<(CommentSide, u64)> {
+    match (rows.get(row_ix)?, side) {
+        (
+            Row::Line {
+                kind: LineKind::Removed,
+                old_no,
+                ..
+            },
+            _,
+        ) => Some((CommentSide::Left, (*old_no)? as u64)),
+        (Row::Line { new_no, .. }, _) => Some((CommentSide::Right, (*new_no)? as u64)),
+        (Row::SplitLine { left, .. }, SelSide::Left) => {
+            Some((CommentSide::Left, left.as_ref()?.no as u64))
+        }
+        (Row::SplitLine { right, .. }, SelSide::Right) => {
+            Some((CommentSide::Right, right.as_ref()?.no as u64))
+        }
+        _ => None,
+    }
 }
 
 impl ReviewApp {
@@ -2330,6 +2883,9 @@ impl ReviewApp {
             minimap_visible: true,
             minimap_scrub: false,
             char_width: None,
+            hover_plus: None,
+            composer: None,
+            composer_gen: 0,
             _subscriptions,
         };
         for source in sources {
@@ -2547,7 +3103,16 @@ impl ReviewApp {
                     .files
                     .iter()
                     .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-                data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
+                // Comment anchors live in the same absolute line-number space
+                // the re-diff produces, so threads re-insert at the re-diffed
+                // rows without translation.
+                data.set_rows(build_rows(
+                    &data.diff,
+                    data.mode,
+                    &data.upgrades,
+                    data.comments.as_ref(),
+                    data.comments_visible,
+                ));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.selection = None;
                 // Paths can't change in an upgrade, but stats did; rebuilding
@@ -2576,12 +3141,18 @@ impl ReviewApp {
         let gap_row = data.rows.iter().position(|row| {
             matches!(row, Row::Gap { file_ix: f, gap_ix: g, .. } if *f == file_ix && *g == gap_ix)
         });
-        // The gap row itself is replaced by `hidden` context rows.
-        let inserted = match gap_row.map(|ix| &data.rows[ix]) {
-            Some(Row::Gap { hidden, .. }) => *hidden as usize - 1,
-            _ => 0,
-        };
-        data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
+        let old_len = data.rows.len();
+        data.set_rows(build_rows(
+            &data.diff,
+            data.mode,
+            &data.upgrades,
+            data.comments.as_ref(),
+            data.comments_visible,
+        ));
+        // The gap row is replaced by its hidden context rows (plus any
+        // comment threads anchored inside them): the row-count delta is
+        // exactly what got inserted.
+        let inserted = data.rows.len().saturating_sub(old_len);
         data.selection = None;
         if let Some(gap_row) = gap_row {
             if data.cursor > gap_row {
@@ -2929,7 +3500,13 @@ impl ReviewApp {
             ViewMode::Unified => ViewMode::Split,
             ViewMode::Split => ViewMode::Unified,
         };
-        data.set_rows(build_rows(&data.diff, data.mode, &data.upgrades));
+        data.set_rows(build_rows(
+            &data.diff,
+            data.mode,
+            &data.upgrades,
+            data.comments.as_ref(),
+            data.comments_visible,
+        ));
         let target = file_pos
             .and_then(|pos| data.file_rows.get(pos).copied())
             .unwrap_or(0);
@@ -3041,6 +3618,406 @@ impl ReviewApp {
             .base_handle
             .set_offset(point(offset.x, px(-target.clamp(0., max_scroll))));
         cx.notify();
+    }
+
+    /// `c`: show/hide the comment rows of the active PR item, keeping the
+    /// viewport anchored at the first visible diff row.
+    fn toggle_comments(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        if data.comments.is_none() {
+            return; // Local item: no comment affordances.
+        }
+        data.comments_visible = !data.comments_visible;
+        data.rebuild_rows_anchored();
+        cx.notify();
+    }
+
+    /// The row + split half under the pointer if it can take a new comment:
+    /// active item is a PR with a known head oid, the pointer is inside the
+    /// diff list, and the row has a line number on that side.
+    fn hover_target(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> Option<(usize, SelSide)> {
+        if self.palette.is_some() {
+            return None;
+        }
+        let char_width = self.char_width(window);
+        let item = self.active_item()?;
+        let Source::Pr(_) = item.source else {
+            return None;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return None;
+        };
+        // New comments post against the head oid; without one (older gh
+        // missing headRefOid) the affordance stays off entirely.
+        if data
+            .pr_meta
+            .as_ref()
+            .is_none_or(|meta| meta.head_ref_oid.is_empty())
+        {
+            return None;
+        }
+        let bounds = data.scroll.0.borrow().base_handle.bounds();
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let (side, hit) = self.pane_hit(position, char_width, None)?;
+        let data = self.active_data()?;
+        comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
+    }
+
+    fn open_composer(
+        &mut self,
+        reply_to: Option<u64>,
+        path: String,
+        side: CommentSide,
+        line: u64,
+        row_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.items.get(self.active) else {
+            return;
+        };
+        let item_id = item.id;
+        let commit_id = self
+            .active_data()
+            .and_then(|data| data.pr_meta.as_ref())
+            .map(|meta| meta.head_ref_oid.clone())
+            .unwrap_or_default();
+        if reply_to.is_none() && commit_id.is_empty() {
+            return;
+        }
+        self.composer_gen += 1;
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(3, 8)
+                .placeholder("leave a comment…")
+        });
+        // cmd-enter: the input's own `secondary-enter` binding emits
+        // PressEnter { secondary: true } (after inserting a newline, which
+        // submit trims away).
+        let _subscription = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if matches!(event, InputEvent::PressEnter { secondary: true }) {
+                    this.submit_composer(window, cx);
+                }
+            },
+        );
+        input.update(cx, |state, cx| state.focus(window, cx));
+        self.composer = Some(Composer {
+            item_id,
+            reply_to,
+            commit_id,
+            path,
+            side,
+            line,
+            row_ix,
+            input,
+            error: None,
+            in_flight: false,
+            _subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer.take().is_some() {
+            self.composer_gen += 1;
+            window.focus(&self.focus_handle);
+            cx.notify();
+        }
+    }
+
+    /// Post the composer's comment (or reply) via gh on the background
+    /// executor. Success closes the composer and refetches only the comments;
+    /// failure surfaces gh's stderr inline in the composer.
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(composer) = &self.composer else {
+            return;
+        };
+        if composer.in_flight {
+            return;
+        }
+        let body = composer.input.read(cx).value().trim().to_string();
+        if body.is_empty() {
+            return;
+        }
+        let Some(item) = self.items.iter().find(|item| item.id == composer.item_id) else {
+            return;
+        };
+        let Source::Pr(loc) = &item.source else {
+            return;
+        };
+        let loc = loc.clone();
+        let item_id = item.id;
+        let gen = self.composer_gen;
+        let (reply_to, commit_id, path, side, line) = {
+            let composer = self.composer.as_mut().unwrap();
+            composer.in_flight = true;
+            composer.error = None;
+            (
+                composer.reply_to,
+                composer.commit_id.clone(),
+                composer.path.clone(),
+                composer.side,
+                composer.line,
+            )
+        };
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let post_loc = loc.clone();
+            let result = cx
+                .background_spawn(async move {
+                    match reply_to {
+                        Some(root_id) => gh::post_reply(&post_loc, root_id, &body),
+                        None => gh::post_review_comment(
+                            &post_loc,
+                            &commit_id,
+                            &path,
+                            side.api_str(),
+                            line,
+                            &body,
+                        ),
+                    }
+                })
+                .await;
+            this.update_in(cx, |app, window, cx| {
+                if app.composer_gen != gen {
+                    return; // The composer was closed or retargeted meanwhile.
+                }
+                match result {
+                    Ok(()) => {
+                        app.close_composer(window, cx);
+                        app.refetch_comments(item_id, loc, cx);
+                    }
+                    Err(err) => {
+                        if let Some(composer) = &mut app.composer {
+                            composer.in_flight = false;
+                            composer.error = Some(format!("{err:#}").into());
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Refetch only the review comments (not meta/patch), regroup, and
+    /// rebuild the rows with the viewport anchored — the counterpart of a
+    /// full refresh for the post-comment path.
+    fn refetch_comments(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_review_comments(&loc) })
+                .await;
+            this.update(cx, |app, cx| {
+                let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
+                    return;
+                };
+                let ItemState::Ready(data) = &mut item.state else {
+                    return;
+                };
+                match fetched {
+                    Ok(comments) => {
+                        data.comments = Some(group_comments(comments));
+                        data.rebuild_rows_anchored();
+                    }
+                    Err(err) => {
+                        item.refresh_error =
+                            Some(format!("comment refresh failed: {err:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The hover "+" affordance: a small blue box at the far left of the
+    /// hovered line (its half, in split mode), absolutely positioned over the
+    /// list like the minimap viewport. Clicking opens the composer for that
+    /// row's anchor.
+    fn render_plus(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (row_ix, side) = self.hover_plus?;
+        if self.palette.is_some() {
+            return None;
+        }
+        let item = self.active_item()?;
+        let Source::Pr(_) = item.source else {
+            return None;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return None;
+        };
+        if data
+            .pr_meta
+            .as_ref()
+            .is_none_or(|meta| meta.head_ref_oid.is_empty())
+        {
+            return None;
+        }
+        let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
+        let file_ix = data.file_rows.iter().rposition(|&header| header <= row_ix)?;
+        let path = data.diff.files[file_ix].display_path().to_string();
+        let (bounds, offset) = {
+            let state = data.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        // Pane-relative y of the hovered row; skip when scrolled out of view.
+        let y = row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
+        if y < 0. || y + ROW_HEIGHT > f32::from(bounds.size.height) {
+            return None;
+        }
+        let x = match (data.mode, side) {
+            (ViewMode::Split, SelSide::Right) => {
+                (f32::from(bounds.size.width) - SPLIT_DIVIDER) / 2. + SPLIT_DIVIDER + 2.
+            }
+            _ => 2.,
+        };
+        let entity = cx.entity();
+        Some(
+            div()
+                .absolute()
+                .left(px(x))
+                .top(px(y + (ROW_HEIGHT - 16.) / 2.))
+                .w(px(16.))
+                .h(px(16.))
+                .rounded_sm()
+                .bg(theme::blue())
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(gpui::white())
+                .text_size(px(13.))
+                .cursor_pointer()
+                .child(SharedString::from("+"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_, window, cx| {
+                        cx.stop_propagation();
+                        let path = path.clone();
+                        entity.update(cx, |this, cx| {
+                            this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                        });
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// The floating composer card: absolutely positioned at root level (so
+    /// its input sits outside the "ReviewApp" key context and plain letters
+    /// stay text), anchored near the target line's y, clamped into the pane.
+    fn render_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let empty = || div().into_any_element();
+        let Some(composer) = &self.composer else {
+            return empty();
+        };
+        // Only render for the item it was opened on, and only while active.
+        if self.items.get(self.active).map(|item| item.id) != Some(composer.item_id) {
+            return empty();
+        }
+        let Some(data) = self.active_data() else {
+            return empty();
+        };
+        let (bounds, offset) = {
+            let state = data.scroll.0.borrow();
+            (state.base_handle.bounds(), state.base_handle.offset())
+        };
+        let pane_h = f32::from(bounds.size.height);
+        let row_y = composer.row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
+        let y = f32::from(bounds.top()) + (row_y + ROW_HEIGHT).clamp(8., (pane_h - 250.).max(8.));
+        let x = (f32::from(bounds.left()) + 72.)
+            .min((f32::from(bounds.right()) - 528.).max(8.));
+        let action = if composer.reply_to.is_some() {
+            "Reply"
+        } else {
+            "Comment"
+        };
+        let target = format!(
+            "{}{}:{} ({})",
+            if composer.reply_to.is_some() { "reply · " } else { "" },
+            composer.path,
+            composer.line,
+            composer.side.api_str()
+        );
+        div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(520.))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // The input propagates Escape when it has nothing of its own to
+            // dismiss; catch it here (before the root's handler) to cancel.
+            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                this.close_composer(window, cx);
+            }))
+            .rounded_lg()
+            .border_1()
+            .border_color(theme::surface0())
+            .bg(theme::mantle())
+            .shadow_lg()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_size(px(12.))
+            .child(
+                div()
+                    .text_color(theme::overlay0())
+                    .truncate()
+                    .child(SharedString::from(target)),
+            )
+            .child(Input::new(&composer.input))
+            .when_some(composer.error.clone(), |card, err| {
+                card.child(div().text_color(theme::red()).child(err))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(theme::overlay0())
+                            .child(SharedString::from("⌘⏎ to submit")),
+                    )
+                    .child(
+                        Button::new("composer-cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .small()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.close_composer(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("composer-submit")
+                            .label(action)
+                            .primary()
+                            .small()
+                            .disabled(composer.in_flight)
+                            .loading(composer.in_flight)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_composer(window, cx);
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// The minimap column: precomputed, coalesced quad runs plus one
@@ -3634,6 +4611,7 @@ impl ReviewApp {
             .child(hint(&["n", "p"], "hunks"))
             .child(hint(&["v"], "unified/split"))
             .child(hint(&["m"], "minimap"))
+            .child(hint(&["c"], "comments"))
             .child(hint(&["/"], "filter files"))
             .child(hint(&["home", "end"], "top/bottom"))
             .child(hint(&["cmd-k"], "palette"))
@@ -3751,7 +4729,7 @@ impl Render for ReviewApp {
                                                     .filter(|range| !range.is_empty())
                                                     .map(|range| (sel.side, range))
                                             });
-                                            render_row(row, row_sel, &entity)
+                                            render_row(ix, row, row_sel, &entity)
                                         })
                                         .collect()
                                 }
@@ -3774,6 +4752,9 @@ impl Render for ReviewApp {
                         pane.child(self.render_minimap(cx))
                     })
                     .child(Scrollbar::new(&data.scroll))
+                    // Hover "+" (add comment) overlay, absolutely positioned
+                    // at the hovered row's y like the minimap viewport.
+                    .children(self.render_plus(cx))
                     .into_any_element(),
             },
         };
@@ -3818,11 +4799,30 @@ impl Render for ReviewApp {
                 this.minimap_visible = !this.minimap_visible;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleComments, _, cx| this.toggle_comments(cx)))
+            // Hover tracking for the "+" affordance lives on the root so the
+            // affordance clears when the pointer leaves the diff list.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if event.dragging() {
+                    return;
+                }
+                let hover = this.hover_target(event.position, window);
+                if this.hover_plus != hover {
+                    this.hover_plus = hover;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
             // Bound in the "ReviewApp" context: these only fire while the
             // diff pane has focus. With the palette open, focus sits in the
             // palette input, so its escape routing (PaletteBack) wins.
-            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| {
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                // With the composer open but focus back on the diff pane,
+                // escape closes the composer before touching the selection.
+                if this.composer.is_some() {
+                    this.close_composer(window, cx);
+                    return;
+                }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
                         cx.notify();
@@ -3892,6 +4892,11 @@ impl Render for ReviewApp {
                     ),
             )
             .child(self.render_footer())
+            // Root-level so the composer's input escapes the "ReviewApp" key
+            // context (plain letters must stay text, like the palette input).
+            .when(self.composer.is_some(), |root| {
+                root.child(self.render_composer(cx))
+            })
             .when(self.palette.is_some(), |root| {
                 root.child(self.render_palette(cx))
             })
@@ -3994,7 +4999,7 @@ mod tests {
 
     #[test]
     fn split_context_fills_both_cells() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new());
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
         match &rows[2] {
             Row::SplitLine { left, right } => {
@@ -4007,7 +5012,7 @@ mod tests {
 
     #[test]
     fn split_pairs_equal_runs_positionally() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new());
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         match &rows[3] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
@@ -4034,7 +5039,7 @@ mod tests {
 
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
-        let (rows, _, hunk_rows) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new());
+        let (rows, _, hunk_rows) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         let h2 = hunk_rows[1];
         // 2 removed / 1 added: first row paired, second left-only.
         match &rows[h2 + 1] {
@@ -4115,6 +5120,9 @@ mod tests {
             Row::Gap { .. } => "Gap",
             Row::Line { .. } => "Line",
             Row::SplitLine { .. } => "SplitLine",
+            Row::CommentHeader { .. } => "CommentHeader",
+            Row::CommentBody { .. } => "CommentBody",
+            Row::CommentActions { .. } => "CommentActions",
         }
     }
 
@@ -4122,7 +5130,7 @@ mod tests {
     fn upgraded_file_gets_gap_rows_and_marked_headers() {
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades);
+            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true);
             // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
             match &rows[1] {
                 Row::Gap { file_ix, gap_ix, hidden } => {
@@ -4141,7 +5149,7 @@ mod tests {
             assert!(row_side_text(&rows[1], SelSide::Left).is_none());
         }
         // Un-upgraded build of the same diff has no gap rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new());
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         assert!(matches!(rows[1], Row::HunkHeader { upgraded: false, .. }));
     }
@@ -4151,7 +5159,7 @@ mod tests {
         let (diff, mut upgrades) = upgraded_diff();
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
 
-        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades);
+        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
         // Leading gap expanded into 6 context rows before the hunk header.
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
@@ -4169,7 +5177,7 @@ mod tests {
         assert!(matches!(rows.last(), Some(Row::Gap { gap_ix: 1, .. })));
 
         // Split mode: same expansion as two-cell context rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades, None, true);
         match &rows[1] {
             Row::SplitLine { left, right } => {
                 let (l, r) = (left.as_ref().unwrap(), right.as_ref().unwrap());
@@ -4183,7 +5191,7 @@ mod tests {
 
         // Expanding the trailing gap too: numbering continues past the hunk.
         upgrades.get_mut(&0).unwrap().expanded.insert(1);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
             Row::Line { old_no, new_no, text, .. } => {
@@ -4504,7 +5512,7 @@ mod tests {
     fn header_indices_are_correct_in_both_modes() {
         let diff = sample_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new());
+            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), None, true);
             assert_eq!(file_rows.len(), 2);
             assert_eq!(hunk_rows.len(), 2);
             for &ix in &file_rows {
@@ -4517,8 +5525,8 @@ mod tests {
             assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
         }
         // Unified emits one row per diff row; split collapses the equal run.
-        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new());
-        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new());
+        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
+        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true);
         let unified_lines = unified.iter().filter(|r| matches!(r, Row::Line { .. })).count();
         let split_lines = split
             .iter()
@@ -4679,7 +5687,7 @@ mod tests {
 
     #[test]
     fn minimap_rows_unified_kinds_and_fracs() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new());
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // FileHeader and HunkHeader both map to Header ticks.
@@ -4696,7 +5704,7 @@ mod tests {
 
     #[test]
     fn minimap_rows_split_pairs_and_gaps() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new());
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // Context pair: both halves, no change flags.
@@ -4744,7 +5752,7 @@ mod tests {
         // Gap rows map to Gap in both modes.
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, _) = build_rows(&diff, mode, &upgrades);
+            let (rows, _, _) = build_rows(&diff, mode, &upgrades, None, true);
             let mm = minimap_rows(&rows);
             assert_eq!(mm[1], mrow(MinimapKind::Gap, 1.));
         }
@@ -4901,6 +5909,314 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // --- Review comments ----------------------------------------------------
+
+    fn rc(
+        id: u64,
+        path: &str,
+        side: Option<&str>,
+        line: Option<u64>,
+        body: &str,
+        author: &str,
+        created_at: &str,
+        reply_to: Option<u64>,
+    ) -> gh::ReviewComment {
+        gh::ReviewComment {
+            id,
+            path: path.to_string(),
+            line,
+            side: side.map(str::to_string),
+            start_line: None,
+            body: body.to_string(),
+            user: gh::Author {
+                login: author.to_string(),
+            },
+            created_at: created_at.to_string(),
+            in_reply_to_id: reply_to,
+        }
+    }
+
+    #[test]
+    fn wrap_preserves_newlines_and_breaks_at_spaces() {
+        // Explicit newlines (and CRLF) survive; empty lines stay empty.
+        assert_eq!(wrap_body("a\n\nb\r\nc", 10), vec!["a", "", "b", "c"]);
+        // Fits exactly: no wrap.
+        assert_eq!(wrap_body("abcde", 5), vec!["abcde"]);
+        // Breaks at the last space in range; the space is consumed.
+        assert_eq!(
+            wrap_body("one two three four", 9),
+            vec!["one two", "three", "four"]
+        );
+        // A word longer than the width hard-breaks; no space is invented.
+        assert_eq!(wrap_body("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // Never splits inside a word when a space exists in range.
+        assert_eq!(wrap_body("aa bbbb", 5), vec!["aa", "bbbb"]);
+        // Multibyte chars: wraps on char boundaries, not bytes.
+        assert_eq!(wrap_body("ééééé", 3), vec!["ééé", "éé"]);
+        assert_eq!(wrap_body("éé éé", 3), vec!["éé", "éé"]);
+    }
+
+    #[test]
+    fn short_age_buckets() {
+        let now = parse_iso_utc("2026-07-09T12:00:00Z").unwrap();
+        assert_eq!(short_age("2026-07-09T11:59:30Z", now), "just now");
+        assert_eq!(short_age("2026-07-09T11:15:00Z", now), "45m ago");
+        assert_eq!(short_age("2026-07-09T05:00:00Z", now), "7h ago");
+        assert_eq!(short_age("2026-07-06T12:00:00Z", now), "3d ago");
+        assert_eq!(short_age("2024-01-01T00:00:00Z", now), "2y ago");
+        // Clock skew (future timestamp) degrades to "just now".
+        assert_eq!(short_age("2026-07-09T12:05:00Z", now), "just now");
+        // Unparseable input renders as-is.
+        assert_eq!(short_age("garbage", now), "garbage");
+    }
+
+    #[test]
+    fn parse_iso_utc_matches_known_epoch() {
+        assert_eq!(parse_iso_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso_utc("2001-09-09T01:46:40Z"), Some(1_000_000_000));
+        assert_eq!(parse_iso_utc("2026-07-09"), None);
+    }
+
+    #[test]
+    fn group_comments_threads_replies_orphans_and_outdated() {
+        let index = group_comments(vec![
+            // Deliberately out of order: grouping sorts by created_at.
+            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
+            rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "alice", "2026-01-01T00:00:00Z", None),
+            // Second thread at the same anchor, created later.
+            rc(3, "a.rs", Some("RIGHT"), Some(2), "later", "carol", "2026-01-03T00:00:00Z", None),
+            // LEFT-side thread on the same line number: distinct anchor.
+            rc(4, "a.rs", Some("LEFT"), Some(2), "old side", "dave", "2026-01-04T00:00:00Z", None),
+            // Outdated: no current line. Counts, never anchors.
+            rc(5, "a.rs", None, None, "stale", "erin", "2026-01-05T00:00:00Z", None),
+            // Orphaned reply: parent never fetched — dropped entirely.
+            rc(6, "a.rs", Some("RIGHT"), Some(2), "orphan", "mallory", "2026-01-06T00:00:00Z", Some(999)),
+            // Reply-to-a-reply lands in the root's thread.
+            rc(7, "a.rs", Some("RIGHT"), Some(2), "nested", "alice", "2026-01-07T00:00:00Z", Some(2)),
+            rc(8, "b.rs", Some("RIGHT"), Some(9), "other file", "bob", "2026-01-08T00:00:00Z", None),
+        ]);
+        let a = &index.threads["a.rs"];
+        let right = &a[&(CommentSide::Right, 2)];
+        assert_eq!(right.len(), 2);
+        assert_eq!(right[0].root.id, 1);
+        assert_eq!(
+            right[0].replies.iter().map(|c| c.id).collect::<Vec<_>>(),
+            vec![2, 7]
+        );
+        assert_eq!(right[1].root.id, 3);
+        assert!(right[1].replies.is_empty());
+        assert_eq!(a[&(CommentSide::Left, 2)][0].root.id, 4);
+        // Counts: anchored = 3 (root+reply+nested) + 1 + 1 = 5 (the orphan
+        // is dropped), outdated = 1.
+        assert_eq!(index.counts["a.rs"], (5, 1));
+        assert_eq!(index.counts["b.rs"], (1, 0));
+        assert_eq!(index.threads["b.rs"][&(CommentSide::Right, 9)].len(), 1);
+    }
+
+    /// Comments for sample_diff's a.rs: a RIGHT thread (with one reply) on
+    /// added line 2 ("new1"), a LEFT thread on removed line 2 ("old1"), and
+    /// one outdated comment.
+    fn sample_comments() -> CommentIndex {
+        group_comments(vec![
+            rc(1, "a.rs", Some("RIGHT"), Some(2), "on new1", "alice", "2026-01-01T00:00:00Z", None),
+            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
+            rc(3, "a.rs", Some("LEFT"), Some(2), "on old1", "carol", "2026-01-03T00:00:00Z", None),
+            rc(4, "a.rs", None, None, "outdated", "dave", "2026-01-04T00:00:00Z", None),
+        ])
+    }
+
+    #[test]
+    fn unified_rows_insert_threads_beneath_their_anchor() {
+        let index = sample_comments();
+        let (rows, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
+        // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        assert_eq!(
+            &names[..12],
+            &[
+                "FileHeader",
+                "HunkHeader",
+                "Line",           // ctx 1/1
+                "Line",           // rem old1 (old 2)
+                "CommentHeader",  // carol on old1
+                "CommentBody",
+                "CommentActions",
+                "Line",           // rem old2
+                "Line",           // add new1 (new 2)
+                "CommentHeader",  // alice
+                "CommentBody",
+                "CommentHeader",  // bob's reply
+            ]
+        );
+        assert_eq!(names[12], "CommentBody");
+        assert_eq!(names[13], "CommentActions");
+        // The LEFT thread is carol's; the reply flag follows position.
+        match &rows[4] {
+            Row::CommentHeader { author, is_reply, .. } => {
+                assert_eq!(author.as_ref(), "carol");
+                assert!(!is_reply);
+            }
+            other => panic!("expected comment header, got {}", row_name(other)),
+        }
+        match &rows[11] {
+            Row::CommentHeader { author, is_reply, .. } => {
+                assert_eq!(author.as_ref(), "bob");
+                assert!(is_reply);
+            }
+            other => panic!("expected reply header, got {}", row_name(other)),
+        }
+        // Actions row targets the thread root and carries the anchor.
+        match &rows[13] {
+            Row::CommentActions { root_id, path, side, line } => {
+                assert_eq!(*root_id, 1);
+                assert_eq!(path.as_ref(), "a.rs");
+                assert_eq!((*side, *line), (CommentSide::Right, 2));
+            }
+            other => panic!("expected actions row, got {}", row_name(other)),
+        }
+        // File header carries the counts (3 anchored, 1 outdated).
+        match &rows[0] {
+            Row::FileHeader { comments, outdated, .. } => {
+                assert_eq!((*comments, *outdated), (3, 1));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+        // Comment rows are selectable-through and blank in the minimap.
+        assert!(row_side_text(&rows[4], SelSide::Unified).is_none());
+        assert_eq!(minimap_rows(&rows)[4], mrow(MinimapKind::Blank, 0.));
+    }
+
+    #[test]
+    fn split_rows_anchor_threads_by_cell() {
+        let index = sample_comments();
+        let (rows, _, _) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), Some(&index), true);
+        // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
+        // thread directly beneath it.
+        let names: Vec<&str> = rows.iter().map(row_name).collect();
+        assert_eq!(
+            &names[2..11],
+            &[
+                "SplitLine",      // ctx
+                "SplitLine",      // old1 | new1
+                "CommentHeader",  // carol (LEFT)
+                "CommentBody",
+                "CommentActions",
+                "CommentHeader",  // alice (RIGHT)
+                "CommentBody",
+                "CommentHeader",  // bob reply
+                "CommentBody",
+            ]
+        );
+        assert_eq!(names[11], "CommentActions");
+        assert_eq!(names[12], "SplitLine"); // old2 | new2
+    }
+
+    #[test]
+    fn hidden_comments_keep_header_counts() {
+        let index = sample_comments();
+        let (rows, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), false);
+        assert!(!rows.iter().any(is_comment_row));
+        match &rows[0] {
+            Row::FileHeader { comments, outdated, .. } => {
+                assert_eq!((*comments, *outdated), (3, 1));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+        // And with no index at all (local items): zero counts, no rows.
+        let (rows, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        assert!(!rows.iter().any(is_comment_row));
+        match &rows[0] {
+            Row::FileHeader { comments, outdated, .. } => {
+                assert_eq!((*comments, *outdated), (0, 0));
+            }
+            other => panic!("expected file header, got {}", row_name(other)),
+        }
+    }
+
+    #[test]
+    fn expanded_gap_context_rows_host_threads() {
+        let (diff, mut upgrades) = upgraded_diff();
+        // a.txt line 3 lives in the leading gap (hunk covers 7..=13).
+        let index = group_comments(vec![rc(
+            9, "a.txt", Some("RIGHT"), Some(3), "gap comment", "alice",
+            "2026-01-01T00:00:00Z", None,
+        )]);
+        let (rows, _, _) =
+            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        // Collapsed gap: the thread has no anchor row and stays hidden.
+        assert!(!rows.iter().any(is_comment_row));
+        upgrades.get_mut(&0).unwrap().expanded.insert(0);
+        let (rows, _, _) =
+            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
+        assert_eq!(row_name(&rows[3]), "Line");
+        assert_eq!(row_name(&rows[4]), "CommentHeader");
+        assert_eq!(row_name(&rows[5]), "CommentBody");
+        assert_eq!(row_name(&rows[6]), "CommentActions");
+    }
+
+    #[test]
+    fn comment_anchor_resolves_sides_and_skips_non_lines() {
+        let index = sample_comments();
+        let (rows, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        // Headers and comment rows anchor nothing.
+        assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
+        assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
+        // Context row (1,1) → RIGHT 1; removed old1 → LEFT 2; added new1 → RIGHT 2.
+        assert_eq!(
+            comment_anchor(&rows, 2, SelSide::Unified),
+            Some((CommentSide::Right, 1))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Unified),
+            Some((CommentSide::Left, 2))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 8, SelSide::Unified),
+            Some((CommentSide::Right, 2))
+        );
+        // Split: the half under the pointer decides; absent cells refuse.
+        let (rows, _, hunk_rows) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Left),
+            Some((CommentSide::Left, 2))
+        );
+        assert_eq!(
+            comment_anchor(&rows, 3, SelSide::Right),
+            Some((CommentSide::Right, 2))
+        );
+        // Second hunk: r2 has no right cell (see split tests above).
+        let h2 = hunk_rows[1];
+        assert_eq!(comment_anchor(&rows, h2 + 2, SelSide::Right), None);
+        assert_eq!(
+            comment_anchor(&rows, h2 + 2, SelSide::Left),
+            Some((CommentSide::Left, 11))
+        );
+    }
+
+    #[test]
+    fn nth_noncomment_row_maps_positions_across_comment_insertions() {
+        let index = sample_comments();
+        let (plain, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (with, _, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        // Every plain row maps to the same row content with comments shown.
+        for (n, row) in plain.iter().enumerate() {
+            let ix = nth_noncomment_row(&with, n);
+            assert_eq!(row_name(&with[ix]), row_name(row), "row {n}");
+        }
+        // n beyond the end clamps to the last row.
+        assert_eq!(nth_noncomment_row(&plain, 999), plain.len() - 1);
     }
 
     #[test]
