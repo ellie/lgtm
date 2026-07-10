@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+claude = { path = "../claude" }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
 git = { path = "../git" }

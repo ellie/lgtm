@@ -7,12 +7,16 @@ use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollStrategy, SharedString, StyledText,
-    Subscription, TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
+    ScrollWheelEvent, SharedString, StyledText, Subscription, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Escape as InputEscape, Input, InputEvent, InputState},
@@ -41,7 +45,7 @@ actions!(
         NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
         ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
         PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap,
-        ToggleComments
+        ToggleComments, ToggleChat
     ]
 );
 
@@ -99,6 +103,7 @@ fn main() {
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
+                KeyBinding::new("cmd-j", ToggleChat, None),
                 KeyBinding::new("cmd-t", OpenInput, None),
                 KeyBinding::new("cmd-w", CloseItem, None),
                 KeyBinding::new("cmd-k", OpenPalette, None),
@@ -1979,6 +1984,12 @@ enum ItemState {
 struct ItemData {
     pr_meta: Option<gh::PrMeta>,
     diff: PrDiff,
+    /// The raw unified patch this diff was parsed from, kept for chat
+    /// context (capped at [`MAX_CHAT_PATCH_BYTES`] when sent).
+    patch: String,
+    /// Per-item chat transcript + session; survives refresh, dies with the
+    /// item.
+    chat: ChatState,
     mode: ViewMode,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
@@ -2147,6 +2158,7 @@ impl ReviewItem {
         let Loaded {
             meta,
             diff,
+            patch,
             mut rows,
             mut file_rows,
             mut hunk_rows,
@@ -2187,6 +2199,7 @@ impl ReviewItem {
                     data.pr_meta = pr_meta;
                 }
                 data.diff = diff;
+                data.patch = patch;
                 data.set_rows((rows, file_rows, hunk_rows));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.additions = additions;
@@ -2199,6 +2212,8 @@ impl ReviewItem {
                 let mut data = Box::new(ItemData {
                     pr_meta,
                     diff,
+                    patch,
+                    chat: ChatState::new(),
                     mode,
                     rows,
                     file_rows,
@@ -2239,6 +2254,8 @@ enum LoadedMeta {
 struct Loaded {
     meta: LoadedMeta,
     diff: PrDiff,
+    /// The raw unified patch the diff was parsed from (chat context).
+    patch: String,
     rows: Vec<Row>,
     file_rows: Vec<usize>,
     hunk_rows: Vec<usize>,
@@ -2278,6 +2295,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
     Ok(Loaded {
         meta,
         diff,
+        patch,
         rows,
         file_rows,
         hunk_rows,
@@ -2758,6 +2776,267 @@ struct Composer {
     _subscription: Subscription,
 }
 
+// --- Chat with Claude -------------------------------------------------------
+
+/// Width of the right-side chat panel.
+const CHAT_WIDTH: f32 = 380.0;
+/// The unified patch included in a session's first message is capped here.
+const MAX_CHAT_PATCH_BYTES: usize = 200 * 1024;
+/// Files above this size are skipped when materializing an exploration dir.
+const MAX_EXPLORE_FILE_BYTES: usize = 1024 * 1024;
+/// Reviewer persona appended to the system prompt on a session's first turn.
+const CHAT_SYSTEM_PROMPT: &str =
+    "You are reviewing this diff. Be concrete; cite file:line for claims about the code.";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChatRole {
+    User,
+    Assistant,
+}
+
+struct ChatMessage {
+    role: ChatRole,
+    text: String,
+    /// Total cost of the run that produced this assistant message.
+    cost: Option<f64>,
+    /// "› included selection: path:lines" marker under a user message.
+    note: Option<String>,
+    /// The run behind this assistant message failed (rendered in red).
+    error: bool,
+}
+
+/// Per-item chat state; lives on ItemData so transcripts follow the item and
+/// die with it. The InputState is created lazily (it needs a Window) the
+/// first time the panel renders for this item.
+struct ChatState {
+    messages: Vec<ChatMessage>,
+    session_id: Option<String>,
+    in_flight: bool,
+    /// Set to stop the current run; claude::chat kills the child on it.
+    /// Replaced (not reset) per send so a stale run can't clear a new one.
+    cancel: Arc<AtomicBool>,
+    input: Option<gpui::Entity<InputState>>,
+    _input_sub: Option<Subscription>,
+    scroll: ScrollHandle,
+    /// Auto-scroll to the bottom on new content, editor-style: sticky until
+    /// the user scrolls up, re-sticks when they scroll back to the bottom.
+    stick_to_bottom: bool,
+    /// Exploration dir passed to claude, fixed at session start: the repo
+    /// root for local items, a materialized scratch dir for PR items with
+    /// blob-upgraded contents, None otherwise.
+    explore_dir: Option<std::path::PathBuf>,
+}
+
+impl ChatState {
+    fn new() -> Self {
+        Self {
+            messages: Vec::new(),
+            session_id: None,
+            in_flight: false,
+            cancel: Arc::new(AtomicBool::new(false)),
+            input: None,
+            _input_sub: None,
+            scroll: ScrollHandle::new(),
+            stick_to_bottom: true,
+            explore_dir: None,
+        }
+    }
+}
+
+/// `text` truncated to at most `cap` bytes on a char boundary, plus whether
+/// anything was cut.
+fn truncate_str(text: &str, cap: usize) -> (&str, bool) {
+    if text.len() <= cap {
+        return (text, false);
+    }
+    let mut cut = cap;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    (&text[..cut], true)
+}
+
+/// First-message context header for a PR item.
+fn pr_chat_header(meta: &gh::PrMeta) -> String {
+    let body = if meta.body.trim().is_empty() {
+        "(no description)"
+    } else {
+        meta.body.trim()
+    };
+    format!(
+        "PR under review: \"{}\" — {}\nAuthor: {} · state: {} · {} ← {}\n\nPR description:\n{}",
+        meta.title,
+        meta.url,
+        meta.author.login,
+        meta.state,
+        meta.base_ref_name,
+        meta.head_ref_name,
+        body,
+    )
+}
+
+/// First-message context header for a local item.
+fn local_chat_header(src: &git::LocalSource) -> String {
+    format!(
+        "Local diff under review: repo {}, branch {} against {}.",
+        dir_name(&src.repo_root),
+        src.branch,
+        src.base_label,
+    )
+}
+
+/// The full prompt for one turn. `context` (header + raw patch) is only
+/// present on a session's first message; the patch is capped at
+/// [`MAX_CHAT_PATCH_BYTES`] with the truncation noted in the prompt.
+fn chat_prompt(context: Option<(&str, &str)>, selection_block: Option<&str>, question: &str) -> String {
+    let mut out = String::new();
+    if let Some((header, patch)) = context {
+        out.push_str(header);
+        out.push_str("\n\nThe unified diff under review:\n```diff\n");
+        let (patch, truncated) = truncate_str(patch, MAX_CHAT_PATCH_BYTES);
+        out.push_str(patch);
+        if !patch.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+        if truncated {
+            out.push_str("(patch truncated at 200KB — ask about specific files if needed)\n");
+        }
+        out.push('\n');
+    }
+    if let Some(block) = selection_block {
+        out.push_str(block);
+        out.push('\n');
+    }
+    out.push_str(question);
+    out
+}
+
+/// What a selection pins down for the chat: the anchor triple (path, side,
+/// line range) plus the selected text.
+#[derive(Debug, PartialEq)]
+struct SelectionInfo {
+    path: String,
+    side: &'static str,
+    lo: u32,
+    hi: u32,
+    text: String,
+}
+
+impl SelectionInfo {
+    fn block(&self) -> String {
+        format!(
+            "Selected text ({}:{}-{}, {} side):\n```\n{}\n```\n",
+            self.path, self.lo, self.hi, self.side, self.text
+        )
+    }
+
+    fn note(&self) -> String {
+        format!("› included selection: {}:{}-{}", self.path, self.lo, self.hi)
+    }
+}
+
+/// Resolve a selection to its anchor info, reusing the same row machinery as
+/// copy. Line numbers come from the selected side (unified rows prefer the
+/// new number); the path is the file containing the selection's start row.
+/// None when the selection has no text.
+fn selection_info(
+    sel: &Selection,
+    rows: &[Row],
+    file_rows: &[usize],
+    diff: &PrDiff,
+) -> Option<SelectionInfo> {
+    let text = selection_text(sel, rows);
+    if text.is_empty() {
+        return None;
+    }
+    let (start, end) = sel.ordered();
+    let file_ix = file_rows.iter().rposition(|&ix| ix <= start.row)?;
+    let path = diff.files.get(file_ix)?.display_path().to_string();
+    let (mut lo, mut hi) = (u32::MAX, 0);
+    for ix in start.row..=end.row.min(rows.len().saturating_sub(1)) {
+        if row_selection_range(sel, ix, &rows[ix]).is_none() {
+            continue;
+        }
+        let no = match (&rows[ix], sel.side) {
+            (Row::Line { old_no, new_no, .. }, _) => new_no.or(*old_no),
+            (Row::SplitLine { left, .. }, SelSide::Left) => left.as_ref().map(|c| c.no),
+            (Row::SplitLine { right, .. }, SelSide::Right) => right.as_ref().map(|c| c.no),
+            _ => None,
+        };
+        if let Some(no) = no {
+            lo = lo.min(no);
+            hi = hi.max(no);
+        }
+    }
+    if lo == u32::MAX {
+        return None;
+    }
+    let side = match sel.side {
+        SelSide::Unified => "unified",
+        SelSide::Left => "LEFT (old)",
+        SelSide::Right => "RIGHT (new)",
+    };
+    Some(SelectionInfo { path, side, lo, hi, text })
+}
+
+/// Scratch dir for one item's materialized exploration files. Includes the
+/// pid: item ids restart at 0 every run, and stale dirs from another process
+/// must never be reused.
+fn chat_scratch_root(item_id: u64) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("review-chat-{}-{item_id}", std::process::id()))
+}
+
+/// A repo-relative path mapped under `root`, preserving the layout. Rejects
+/// absolute paths and any non-normal component (`..`, `.`) so materialized
+/// files can't escape the scratch dir.
+fn scratch_path(root: &Path, rel: &str) -> Option<std::path::PathBuf> {
+    let rel = Path::new(rel);
+    if rel.as_os_str().is_empty()
+        || !rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+/// Write blob-upgraded new-side files into `root`, best-effort: oversized
+/// files, unsafe paths, and individual write failures are skipped. Returns
+/// the root when it could be created at all.
+fn materialize_files(root: &Path, files: &[(String, String)]) -> Option<std::path::PathBuf> {
+    std::fs::create_dir_all(root).ok()?;
+    for (rel, content) in files {
+        if content.len() > MAX_EXPLORE_FILE_BYTES {
+            continue;
+        }
+        let Some(path) = scratch_path(root, rel) else {
+            continue;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&path, content);
+    }
+    Some(root.to_path_buf())
+}
+
+/// How the next chat run gets its exploration dir, decided at send time.
+enum ExplorePlan {
+    /// No tools: patch-only context.
+    None,
+    /// An existing directory (local repo root, or an already-materialized
+    /// scratch dir from an earlier turn).
+    Dir(std::path::PathBuf),
+    /// PR item, first turn with blob upgrades: write these (path, content)
+    /// pairs under `root` on the background executor, then use it.
+    Materialize {
+        root: std::path::PathBuf,
+        files: Vec<(String, String)>,
+    },
+}
+
 struct ReviewApp {
     items: Vec<ReviewItem>,
     active: usize,
@@ -2779,6 +3058,8 @@ struct ReviewApp {
     drag_anchor: Option<(SelSide, RowCol)>,
     /// `m` toggles the minimap column for every item.
     minimap_visible: bool,
+    /// `cmd-j` toggles the right-side chat panel (transcripts are per-item).
+    chat_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     minimap_scrub: bool,
     /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
@@ -2832,6 +3113,14 @@ impl ReviewApp {
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
         let _subscriptions = vec![
+            // Best-effort cleanup of every item's chat scratch dir on quit
+            // (close_item handles the per-item case).
+            cx.on_app_quit(|this: &mut Self, _cx| {
+                for item in &this.items {
+                    let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
+                }
+                async {}
+            }),
             cx.subscribe_in(
                 &open_input,
                 window,
@@ -2881,6 +3170,7 @@ impl ReviewApp {
             palette_scroll: UniformListScrollHandle::new(),
             drag_anchor: None,
             minimap_visible: true,
+            chat_visible: false,
             minimap_scrub: false,
             char_width: None,
             hover_plus: None,
@@ -3453,6 +3743,13 @@ impl ReviewApp {
         if ix >= self.items.len() {
             return;
         }
+        // Stop any in-flight chat run and drop its scratch dir (best-effort;
+        // the path is ours and never the local repo root).
+        let item = &self.items[ix];
+        if let ItemState::Ready(data) = &item.state {
+            data.chat.cancel.store(true, Ordering::Relaxed);
+        }
+        let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
         self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
@@ -3842,6 +4139,539 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    /// The chat state of the item with `item_id`, if it is still open and
+    /// loaded. Chat tasks address items by id so streams land on the right
+    /// transcript regardless of switching/closing.
+    fn chat_mut(&mut self, item_id: u64) -> Option<&mut ChatState> {
+        match &mut self.items.iter_mut().find(|item| item.id == item_id)?.state {
+            ItemState::Ready(data) => Some(&mut data.chat),
+            _ => None,
+        }
+    }
+
+    /// `cmd-j`: toggle the chat panel; opening focuses the active item's
+    /// chat input.
+    fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.chat_visible = !self.chat_visible;
+        if self.chat_visible {
+            // The chat input can't take focus under the palette (same as the
+            // cmd-t open input).
+            self.palette = None;
+            self.palette_gen += 1;
+            self.ensure_chat_input(window, cx);
+            if let Some(input) = self.active_data().and_then(|data| data.chat.input.clone()) {
+                input.update(cx, |state, cx| state.focus(window, cx));
+            }
+        } else {
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    /// Create the active item's chat InputState on first use (it needs a
+    /// Window, which ItemData construction doesn't have).
+    fn ensure_chat_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.active_data() {
+            Some(data) if data.chat.input.is_none() => {}
+            _ => return,
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .auto_grow(2, 6)
+                .placeholder("ask about this diff…")
+        });
+        // cmd-enter sends — same secondary-enter pattern as the comment
+        // composer (the newline it inserts first is trimmed on send).
+        let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+            if matches!(event, InputEvent::PressEnter { secondary: true }) {
+                this.send_chat(window, cx);
+            }
+        });
+        if let Some(data) = self.active_data_mut() {
+            data.chat.input = Some(input);
+            data.chat._input_sub = Some(sub);
+        }
+    }
+
+    /// Stop the active item's streaming run, if any. Returns whether there
+    /// was one (escape falls through to other meanings when there wasn't).
+    fn cancel_chat(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(data) = self.active_data_mut() else {
+            return false;
+        };
+        if !data.chat.in_flight {
+            return false;
+        }
+        // claude::chat kills the child; the pump's finish path then clears
+        // in_flight and marks the message stopped.
+        data.chat.cancel.store(true, Ordering::Relaxed);
+        cx.notify();
+        true
+    }
+
+    /// Send the chat input's text: append the user message (with a selection
+    /// marker when one is included), stream the reply on the background
+    /// executor, and batch deltas back at ~50ms into the transcript.
+    fn send_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get_mut(self.active) else {
+            return;
+        };
+        let item_id = item.id;
+        let source = item.source.clone();
+        let ItemState::Ready(data) = &mut item.state else {
+            return;
+        };
+        if data.chat.in_flight {
+            return;
+        }
+        let Some(input) = data.chat.input.clone() else {
+            return;
+        };
+        let text = input.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+
+        let first = data.chat.session_id.is_none();
+        let sel_info = data
+            .selection
+            .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff));
+        let sel_block = sel_info.as_ref().map(|info| info.block());
+        // The transcript shows only the typed text; the context header,
+        // patch, and selection ride along invisibly in the real prompt.
+        let header = first.then(|| match (&source, &data.pr_meta) {
+            (Source::Pr(_), Some(meta)) => pr_chat_header(meta),
+            (Source::Pr(loc), None) => {
+                format!("PR under review: {}#{}", loc.repo_slug(), loc.number)
+            }
+            (Source::Local(src), _) => local_chat_header(src),
+        });
+        let prompt = chat_prompt(
+            header.as_deref().map(|h| (h, data.patch.as_str())),
+            sel_block.as_deref(),
+            &text,
+        );
+
+        let explore = match &data.chat.explore_dir {
+            Some(dir) => ExplorePlan::Dir(dir.clone()),
+            None => match &source {
+                Source::Local(src) => ExplorePlan::Dir(src.repo_root.clone()),
+                // PR with blob-upgraded contents: materialize the new-side
+                // files once, at session start.
+                Source::Pr(_) if first && !data.upgrades.is_empty() => {
+                    let files = data
+                        .upgrades
+                        .iter()
+                        .filter_map(|(&ix, upgrade)| {
+                            let path = data.diff.files.get(ix)?.new_path.clone()?;
+                            if upgrade.new_lines.is_empty() {
+                                return None;
+                            }
+                            let mut content = upgrade
+                                .new_lines
+                                .iter()
+                                .map(|line| line.as_ref())
+                                .collect::<Vec<&str>>()
+                                .join("\n");
+                            content.push('\n');
+                            Some((path, content))
+                        })
+                        .collect();
+                    ExplorePlan::Materialize {
+                        root: chat_scratch_root(item_id),
+                        files,
+                    }
+                }
+                Source::Pr(_) => ExplorePlan::None,
+            },
+        };
+
+        let session = data.chat.session_id.clone();
+        let system_prompt = first.then(|| CHAT_SYSTEM_PROMPT.to_string());
+        let cancel = Arc::new(AtomicBool::new(false));
+        data.chat.cancel = cancel.clone();
+        data.chat.in_flight = true;
+        data.chat.stick_to_bottom = true;
+        data.chat.messages.push(ChatMessage {
+            role: ChatRole::User,
+            text,
+            cost: None,
+            note: sel_info.as_ref().map(|info| info.note()),
+            error: false,
+        });
+        data.chat.messages.push(ChatMessage {
+            role: ChatRole::Assistant,
+            text: String::new(),
+            cost: None,
+            note: None,
+            error: false,
+        });
+        data.chat.scroll.scroll_to_bottom();
+        input.update(cx, |state, cx| state.set_value("", window, cx));
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let explore_dir = match explore {
+                ExplorePlan::None => None,
+                ExplorePlan::Dir(dir) => Some(dir),
+                ExplorePlan::Materialize { root, files } => {
+                    cx.background_spawn(async move { materialize_files(&root, &files) })
+                        .await
+                }
+            };
+            if let Some(dir) = explore_dir.clone() {
+                this.update(cx, |app, _| {
+                    if let Some(chat) = app.chat_mut(item_id) {
+                        chat.explore_dir = Some(dir);
+                    }
+                })
+                .ok();
+            }
+            let opts = claude::ChatOptions {
+                session,
+                system_prompt,
+                explore_dir,
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let cancel_bg = cancel.clone();
+            let task = cx.background_spawn(async move {
+                claude::chat(&prompt, &opts, &cancel_bg, |event| {
+                    let _ = tx.send(event);
+                })
+            });
+            // Throttled pump: every ~50ms drain whatever streamed in and
+            // apply it as one entity update — never one update per token.
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let mut delta = String::new();
+                let mut terminals = Vec::new();
+                let mut disconnected = false;
+                loop {
+                    match rx.try_recv() {
+                        Ok(claude::ChatEvent::TextDelta(text)) => delta.push_str(&text),
+                        Ok(event) => terminals.push(event),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
+                    }
+                }
+                if !delta.is_empty() || !terminals.is_empty() {
+                    let alive = this
+                        .update(cx, |app, cx| {
+                            app.apply_chat_events(item_id, &delta, terminals, cx)
+                        })
+                        .is_ok();
+                    if !alive {
+                        // App gone: make sure the subprocess dies too.
+                        cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if disconnected {
+                    break;
+                }
+            }
+            let result = task.await;
+            this.update(cx, |app, cx| {
+                app.finish_chat(item_id, result.err().map(|err| format!("{err:#}")), cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Fold one pump batch into the transcript: text deltas append to the
+    /// trailing assistant message, Completed installs the authoritative text
+    /// + cost + session id, Failed marks the message as an error.
+    fn apply_chat_events(
+        &mut self,
+        item_id: u64,
+        delta: &str,
+        terminals: Vec<claude::ChatEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(chat) = self.chat_mut(item_id) else {
+            return;
+        };
+        if !chat.in_flight {
+            return;
+        }
+        if !delta.is_empty() {
+            if let Some(msg) = chat
+                .messages
+                .last_mut()
+                .filter(|msg| msg.role == ChatRole::Assistant)
+            {
+                msg.text.push_str(delta);
+            }
+        }
+        for event in terminals {
+            let msg = chat
+                .messages
+                .last_mut()
+                .filter(|msg| msg.role == ChatRole::Assistant);
+            match event {
+                claude::ChatEvent::Completed {
+                    session_id,
+                    cost_usd,
+                    is_error,
+                    text,
+                } => {
+                    if !session_id.is_empty() {
+                        chat.session_id = Some(session_id);
+                    }
+                    chat.in_flight = false;
+                    if let Some(msg) = msg {
+                        if !text.is_empty() {
+                            msg.text = text;
+                        }
+                        msg.cost = Some(cost_usd);
+                        msg.error = is_error;
+                    }
+                }
+                claude::ChatEvent::Failed(reason) => {
+                    chat.in_flight = false;
+                    if let Some(msg) = msg {
+                        if !msg.text.is_empty() {
+                            msg.text.push_str("\n\n");
+                        }
+                        msg.text.push_str("chat failed: ");
+                        msg.text.push_str(&reason);
+                        msg.error = true;
+                    }
+                }
+                claude::ChatEvent::TextDelta(_) => {}
+            }
+        }
+        if chat.stick_to_bottom {
+            chat.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    /// Close out a run that ended without a terminal event: user-cancelled,
+    /// or `claude` couldn't be spawned at all.
+    fn finish_chat(&mut self, item_id: u64, spawn_error: Option<String>, cx: &mut Context<Self>) {
+        let Some(chat) = self.chat_mut(item_id) else {
+            return;
+        };
+        if !chat.in_flight {
+            return;
+        }
+        chat.in_flight = false;
+        if let Some(msg) = chat
+            .messages
+            .last_mut()
+            .filter(|msg| msg.role == ChatRole::Assistant)
+        {
+            match spawn_error {
+                Some(err) => {
+                    msg.text = err;
+                    msg.error = true;
+                }
+                None => {
+                    if !msg.text.is_empty() {
+                        msg.text.push(' ');
+                    }
+                    msg.text.push_str("— stopped");
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The right-side chat panel: header (+ Stop while streaming), the
+    /// scrollable transcript, and the multi-line input. Streaming behavior
+    /// (auto-scroll, live deltas, cancel) is verified manually.
+    fn render_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        self.ensure_chat_input(window, cx);
+        let panel = div()
+            .w(px(CHAT_WIDTH))
+            .flex_shrink_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .bg(theme::mantle())
+            .border_l_1()
+            .border_color(theme::surface0())
+            .text_size(px(13.))
+            // The chat input propagates Escape when it has nothing of its
+            // own to dismiss: stop a streaming run, else return to the diff.
+            .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                if !this.cancel_chat(cx) {
+                    window.focus(&this.focus_handle);
+                }
+            }));
+        let Some(data) = self.active_data() else {
+            return panel
+                .child(centered_message(
+                    "open an item to chat about it".into(),
+                    theme::overlay0(),
+                ))
+                .into_any_element();
+        };
+        let chat = &data.chat;
+
+        let mut header = div()
+            .h(px(34.))
+            .flex_shrink_0()
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_2()
+            .border_b_1()
+            .border_color(theme::surface0())
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(theme::text())
+                    .child(SharedString::from("chat")),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from("claude")),
+            )
+            .child(div().flex_1());
+        if chat.in_flight {
+            header = header.child(
+                Button::new("chat-stop")
+                    .label("Stop")
+                    .small()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_chat(cx);
+                    })),
+            );
+        }
+
+        let mut column = div().w_full().flex().flex_col().gap_3().p_3();
+        if chat.messages.is_empty() {
+            column = column.child(
+                div()
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from(
+                        "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
+                    )),
+            );
+        }
+        let last = chat.messages.len().saturating_sub(1);
+        for (ix, msg) in chat.messages.iter().enumerate() {
+            match msg.role {
+                ChatRole::User => {
+                    let mut wrap = div().w_full().flex().flex_col().items_end().gap_1().child(
+                        div()
+                            .max_w(px(CHAT_WIDTH - 64.))
+                            .bg(theme::surface0())
+                            .rounded_md()
+                            .px_2()
+                            .py_1()
+                            .text_color(theme::text())
+                            .child(SharedString::from(msg.text.clone())),
+                    );
+                    if let Some(note) = &msg.note {
+                        wrap = wrap.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme::overlay0())
+                                .truncate()
+                                .child(SharedString::from(note.clone())),
+                        );
+                    }
+                    column = column.child(wrap);
+                }
+                ChatRole::Assistant => {
+                    let mut text = msg.text.clone();
+                    if chat.in_flight && ix == last {
+                        text.push_str(" ▌");
+                    }
+                    let mut wrap = div().w_full().min_w_0().flex().flex_col().gap_1().child(
+                        div()
+                            .text_color(if msg.error { theme::red() } else { theme::text() })
+                            .child(SharedString::from(text)),
+                    );
+                    if let Some(cost) = msg.cost {
+                        wrap = wrap.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme::overlay0())
+                                .child(SharedString::from(format!("${cost:.4}"))),
+                        );
+                    }
+                    column = column.child(wrap);
+                }
+            }
+        }
+        let messages = div()
+            .id("chat-messages")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&chat.scroll)
+            // Stick-to-bottom the way editors do it: scrolling up unsticks,
+            // scrolling back to (near) the bottom re-sticks.
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, _| {
+                let Some(data) = this.active_data_mut() else {
+                    return;
+                };
+                let chat = &mut data.chat;
+                let dy = f32::from(event.delta.pixel_delta(px(ROW_HEIGHT)).y);
+                if dy > 0. {
+                    chat.stick_to_bottom = false;
+                } else {
+                    let scrolled = -f32::from(chat.scroll.offset().y);
+                    let max = f32::from(chat.scroll.max_offset().height);
+                    chat.stick_to_bottom = scrolled >= max - 8.;
+                }
+            }))
+            .child(column);
+
+        let sel_hint = data
+            .selection
+            .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff))
+            .map(|info| format!("will include selection {}:{}-{}", info.path, info.lo, info.hi));
+        let mut input_area = div()
+            .p_2()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme::surface0())
+            .flex()
+            .flex_col()
+            .gap_1();
+        if let Some(hint) = sel_hint {
+            input_area = input_area.child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(theme::blue())
+                    .truncate()
+                    .child(SharedString::from(hint)),
+            );
+        }
+        if let Some(input) = &chat.input {
+            input_area = input_area.child(Input::new(input));
+        }
+        input_area = input_area.child(
+            div()
+                .text_size(px(10.))
+                .text_color(theme::overlay0())
+                .child(SharedString::from(if chat.in_flight {
+                    "streaming… esc to stop"
+                } else {
+                    "⌘⏎ to send"
+                })),
+        );
+
+        panel
+            .child(header)
+            .child(messages)
+            .child(input_area)
+            .into_any_element()
     }
 
     /// The hover "+" affordance: a small blue box at the far left of the
@@ -4617,12 +5447,13 @@ impl ReviewApp {
             .child(hint(&["cmd-k"], "palette"))
             .child(hint(&["cmd-t"], "open"))
             .child(hint(&["cmd-b"], "sidebar"))
+            .child(hint(&["cmd-j"], "chat"))
             .child(hint(&["r"], "refresh"))
     }
 }
 
 impl Render for ReviewApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
         let pane: gpui::AnyElement = match self.active_item() {
             None => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
@@ -4800,6 +5631,9 @@ impl Render for ReviewApp {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleComments, _, cx| this.toggle_comments(cx)))
+            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| {
+                this.toggle_chat(window, cx)
+            }))
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -4821,6 +5655,10 @@ impl Render for ReviewApp {
                 // escape closes the composer before touching the selection.
                 if this.composer.is_some() {
                     this.close_composer(window, cx);
+                    return;
+                }
+                // Next in line: a streaming chat run — escape stops it.
+                if this.cancel_chat(cx) {
                     return;
                 }
                 if let Some(data) = this.active_data_mut() {
@@ -4889,7 +5727,14 @@ impl Render for ReviewApp {
                             .key_context("ReviewApp")
                             .track_focus(&self.focus_handle)
                             .child(pane),
-                    ),
+                    )
+                    // Chat panel: a sibling of the diff pane, outside the
+                    // "ReviewApp" key context so typing in its input never
+                    // triggers diff keys — the same isolation the palette
+                    // and composer inputs rely on.
+                    .when(self.chat_visible, |main| {
+                        main.child(self.render_chat(window, cx))
+                    }),
             )
             .child(self.render_footer())
             // Root-level so the composer's input escapes the "ReviewApp" key
@@ -6217,6 +7062,153 @@ mod tests {
         }
         // n beyond the end clamps to the last row.
         assert_eq!(nth_noncomment_row(&plain, 999), plain.len() - 1);
+    }
+
+    // --- Chat with Claude ----------------------------------------------------
+
+    #[test]
+    fn chat_prompt_first_message_carries_header_patch_and_selection() {
+        let prompt = chat_prompt(
+            Some(("HEADER", "diff --git a/x b/x\n+new line\n")),
+            Some("Selected text (x:1-1, RIGHT (new) side):\n```\nnew line\n```\n"),
+            "why?",
+        );
+        assert!(prompt.starts_with("HEADER\n\nThe unified diff under review:\n```diff\n"));
+        assert!(prompt.contains("+new line\n```\n"));
+        assert!(!prompt.contains("truncated"));
+        assert!(prompt.contains("Selected text (x:1-1"));
+        assert!(prompt.ends_with("why?"));
+        // Later turns: no context block, just selection (if any) + question.
+        let followup = chat_prompt(None, None, "and this?");
+        assert_eq!(followup, "and this?");
+    }
+
+    #[test]
+    fn chat_prompt_truncates_patch_at_cap_on_char_boundary() {
+        // 'a' then 2-byte 'é's: char boundaries sit at odd offsets, so the
+        // even cap falls mid-char and must be shaved back to a boundary.
+        let patch = format!("a{}", "é".repeat(MAX_CHAT_PATCH_BYTES));
+        let prompt = chat_prompt(Some(("H", &patch)), None, "q");
+        assert!(prompt.contains("(patch truncated at 200KB"));
+        let (cut, truncated) = truncate_str(&patch, MAX_CHAT_PATCH_BYTES);
+        assert!(truncated);
+        assert_eq!(cut.len(), MAX_CHAT_PATCH_BYTES - 1); // boundary shaved one byte
+        assert!(cut.is_char_boundary(cut.len()));
+        let (all, truncated) = truncate_str("abc", 10);
+        assert_eq!((all, truncated), ("abc", false));
+    }
+
+    #[test]
+    fn chat_headers_describe_the_item() {
+        let meta = gh::PrMeta {
+            number: 7,
+            title: "Fix the frobnicator".into(),
+            author: gh::Author { login: "alice".into() },
+            state: "OPEN".into(),
+            url: "https://github.com/o/r/pull/7".into(),
+            body: "It was broken.\n".into(),
+            base_ref_name: "main".into(),
+            head_ref_name: "fix".into(),
+            base_ref_oid: String::new(),
+            head_ref_oid: String::new(),
+            additions: 1,
+            deletions: 2,
+            changed_files: 3,
+        };
+        let header = pr_chat_header(&meta);
+        assert!(header.contains("\"Fix the frobnicator\""));
+        assert!(header.contains("https://github.com/o/r/pull/7"));
+        assert!(header.contains("alice"));
+        assert!(header.contains("OPEN"));
+        assert!(header.contains("main ← fix"));
+        assert!(header.contains("It was broken."));
+        // Empty body → explicit placeholder, so the model doesn't guess.
+        let meta = gh::PrMeta { body: "  \n".into(), ..meta };
+        assert!(pr_chat_header(&meta).contains("(no description)"));
+
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_label: "origin/main".into(),
+            base_oid: None,
+        };
+        let header = local_chat_header(&src);
+        assert!(header.contains("myrepo"));
+        assert!(header.contains("feature"));
+        assert!(header.contains("origin/main"));
+    }
+
+    #[test]
+    fn selection_info_resolves_anchor_and_text() {
+        let (rows, file_rows, _) =
+            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
+        // rem(3 "old2"), add(2 "new1"), …
+        let unified = sel(SelSide::Unified, (2, 0), (5, 4));
+        let info = selection_info(&unified, &rows, &file_rows, &sample_diff()).unwrap();
+        assert_eq!(info.path, "a.rs");
+        assert_eq!(info.side, "unified");
+        // ctx new_no 1 .. rem old2 old_no 3 / add new1 new_no 2 → lo 1, hi 3.
+        assert_eq!((info.lo, info.hi), (1, 3));
+        assert_eq!(info.text, "ctx\nold1\nold2\nnew1");
+        assert!(info.block().contains("a.rs:1-3, unified side"));
+        assert_eq!(info.note(), "› included selection: a.rs:1-3");
+
+        // Split selection locked to the right side.
+        let (rows, file_rows, _) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let right = sel(SelSide::Right, (3, 0), (4, 4));
+        let info = selection_info(&right, &rows, &file_rows, &sample_diff()).unwrap();
+        assert_eq!(info.side, "RIGHT (new)");
+        assert_eq!((info.lo, info.hi), (2, 3));
+        assert_eq!(info.text, "new1\nnew2");
+
+        // A selection with no text (headers only) yields nothing.
+        let empty = sel(SelSide::Unified, (0, 0), (0, 5));
+        assert_eq!(selection_info(&empty, &rows, &file_rows, &sample_diff()), None);
+    }
+
+    #[test]
+    fn scratch_paths_stay_inside_the_root() {
+        let root = Path::new("/tmp/review-chat-1-2");
+        assert_eq!(
+            scratch_path(root, "src/main.rs"),
+            Some(root.join("src/main.rs"))
+        );
+        assert_eq!(
+            scratch_path(root, "deep/a/b/c.txt"),
+            Some(root.join("deep/a/b/c.txt"))
+        );
+        // Escapes and non-normal components are refused.
+        assert_eq!(scratch_path(root, "../evil"), None);
+        assert_eq!(scratch_path(root, "a/../../evil"), None);
+        assert_eq!(scratch_path(root, "/abs/path"), None);
+        assert_eq!(scratch_path(root, "./x"), None);
+        assert_eq!(scratch_path(root, ""), None);
+    }
+
+    #[test]
+    fn materialize_writes_files_and_skips_oversized_and_unsafe() {
+        let root = std::env::temp_dir().join(format!(
+            "review-chat-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = vec![
+            ("src/lib.rs".to_string(), "fn a() {}\n".to_string()),
+            ("../escape.rs".to_string(), "nope\n".to_string()),
+            ("big.rs".to_string(), "x".repeat(MAX_EXPLORE_FILE_BYTES + 1)),
+        ];
+        let dir = materialize_files(&root, &files).unwrap();
+        assert_eq!(dir, root);
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "fn a() {}\n"
+        );
+        assert!(!root.join("big.rs").exists());
+        assert!(!root.parent().unwrap().join("escape.rs").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

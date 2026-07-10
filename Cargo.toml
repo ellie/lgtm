@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/diff-core", "crates/gh", "crates/git", "crates/syntax", "crates/app"]
+members = ["crates/diff-core", "crates/gh", "crates/git", "crates/syntax", "crates/claude", "crates/app"]
 
 [workspace.dependencies]
 anyhow = "1"

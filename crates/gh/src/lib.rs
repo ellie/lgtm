@@ -94,6 +94,10 @@ pub struct PrMeta {
     pub author: Author,
     pub state: String,
     pub url: String,
+    /// PR description (markdown); empty when the PR has none. Used as chat
+    /// context, not rendered in the UI.
+    #[serde(default)]
+    pub body: String,
     pub base_ref_name: String,
     pub head_ref_name: String,
     #[serde(default)]
@@ -118,7 +122,7 @@ pub fn fetch_meta(loc: &PrLocator) -> Result<PrMeta> {
         "--repo",
         &loc.repo_slug(),
         "--json",
-        "number,title,author,state,url,baseRefName,headRefName,baseRefOid,headRefOid,\
+        "number,title,author,state,url,body,baseRefName,headRefName,baseRefOid,headRefOid,\
          additions,deletions,changedFiles",
     ])?;
     serde_json::from_str(&json).context("unexpected gh pr view JSON")

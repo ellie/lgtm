@@ -877,6 +877,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "claude"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+]
+
+[[package]]
 name = "cocoa"
 version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4777,6 +4785,7 @@ name = "review"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "claude",
  "diff-core",
  "fuzzy-matcher",
  "gh",
