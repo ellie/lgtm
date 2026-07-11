@@ -1,3 +1,4 @@
+mod config;
 mod theme;
 
 use anyhow::anyhow;
@@ -28,20 +29,29 @@ use gpui_component::{
 use std::ops::Range;
 use std::path::Path;
 
-/// Monospace family: macOS ships Menlo by default, Linux boxes usually don't
-/// have it. On Linux we ask for DejaVu Sans Mono (almost always present) and
-/// let fontconfig fall back to whatever monospace is installed otherwise.
-const MONO: &str = if cfg!(target_os = "macos") {
-    "Menlo"
-} else {
-    "DejaVu Sans Mono"
-};
 /// Primary modifier: cmd on macOS, ctrl elsewhere. The GPUI `Keystroke` parser
 /// accepts both names, but `cmd` is the macOS super key and doesn't fire on
 /// Linux under default bindings, so we have to remap.
 const MOD: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
 const ROW_HEIGHT: f32 = 22.0;
-const TEXT_SIZE: f32 = 13.0;
+
+/// Resolved font/text-size pair: config value if the user set one, otherwise
+/// the per-OS built-in default. Returns owned strings because the config may
+/// have supplied a custom family that we don't want to keep alive in a
+/// `&'static str`.
+fn mono_family(cfg: &config::Config) -> String {
+    if cfg.font.mono_family.is_empty() {
+        config::default_mono_family().to_string()
+    } else {
+        cfg.font.mono_family.clone()
+    }
+}
+
+fn mono_text_size(cfg: &config::Config) -> f32 {
+    cfg.font
+        .mono_text_size
+        .unwrap_or_else(config::default_mono_text_size)
+}
 
 /// Gutter widths in px, matching render_row's fixed-width children: unified is
 /// two 44px line-number columns + a 28px marker; each split cell is one of
@@ -61,6 +71,7 @@ actions!(
 );
 
 fn main() {
+    let cfg = config::Config::load();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut sources = Vec::new();
     let mut errors = Vec::new();
@@ -151,7 +162,7 @@ fn main() {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let view = cx.new(|cx| ReviewApp::new(sources, errors, window, cx));
+                    let view = cx.new(|cx| ReviewApp::new(sources, errors, window, cx, cfg));
                     window.focus(&view.read(cx).focus_handle);
                     cx.new(|cx| Root::new(view, window, cx))
                 },
@@ -3118,8 +3129,19 @@ struct ReviewApp {
     chat_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     minimap_scrub: bool,
-    /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
+    /// Advance width of one monospace cell, measured once via the text
+    /// system at the resolved monospace family + text size.
     char_width: Option<Pixels>,
+    /// Resolved monospace font family (`cfg.font.mono_family` or the per-OS
+    /// default). Owned so a user-supplied family from the config file isn't
+    /// tied to the config struct's lifetime.
+    mono_family: String,
+    /// Resolved monospace text size (px).
+    mono_text_size: f32,
+    /// One-time warning shown in the footer when the requested monospace
+    /// family couldn't be resolved and fontconfig fell back to its default.
+    /// None until we render the first frame and discover the fallback.
+    font_warning: Option<SharedString>,
     /// Diff row + split half under the pointer where a hover "+" (new
     /// comment) affordance shows; None when the pointer isn't on a
     /// commentable line of a PR item.
@@ -3166,7 +3188,10 @@ impl ReviewApp {
         errors: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        cfg: config::Config,
     ) -> Self {
+        let mono_family = mono_family(&cfg);
+        let mono_text_size = mono_text_size(&cfg);
         let open_input = cx
             .new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let palette_input = cx.new(|cx| InputState::new(window, cx));
@@ -3233,6 +3258,9 @@ impl ReviewApp {
             chat_visible: false,
             minimap_scrub: false,
             char_width: None,
+            mono_family,
+            mono_text_size,
+            font_warning: None,
             hover_plus: None,
             composer: None,
             composer_gen: 0,
@@ -3266,14 +3294,15 @@ impl ReviewApp {
     }
 
     /// Advance width of one monospace cell, measured once via the text system
-    /// (Menlo is monospace, so 'm' stands in for every glyph).
+    /// at the user's resolved monospace family + text size. We resolve 'm'
+    /// width because every glyph in a real monospace font is the same width.
     fn char_width(&mut self, window: &Window) -> Pixels {
         *self.char_width.get_or_insert_with(|| {
             let text_system = window.text_system();
-            let font_id = text_system.resolve_font(&font(MONO));
+            let font_id = text_system.resolve_font(&font(self.mono_family.clone()));
             text_system
-                .em_advance(font_id, px(TEXT_SIZE))
-                .unwrap_or(px(TEXT_SIZE * 0.6))
+                .em_advance(font_id, px(self.mono_text_size))
+                .unwrap_or(px(self.mono_text_size * 0.6))
         })
     }
 
@@ -5753,6 +5782,35 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    /// Detect a font-family fallback by asking fontconfig what it actually
+    /// picked for the user's requested family, then comparing against the
+    /// system monospace default. If they match, the user's family wasn't
+    /// installed and fontconfig fell back silently. On platforms without
+    /// `fc-match` (stock macOS), the detection is a no-op — CoreText on macOS
+    /// rarely silently falls back the way fontconfig does, and the few users
+    /// who do install fontconfig via brew get the warning.
+    fn check_font_fallback(&mut self) {
+        if self.font_warning.is_some() {
+            return;
+        }
+        if self.mono_family == config::default_mono_family() {
+            return;
+        }
+        let Some(resolved) = config::fc_match(&self.mono_family) else {
+            return;
+        };
+        if resolved.eq_ignore_ascii_case(&self.mono_family) {
+            return;
+        }
+        self.font_warning = Some(
+            format!(
+                "font '{0}' not found, using {1}",
+                self.mono_family, resolved
+            )
+            .into(),
+        );
+    }
+
     fn render_footer(&self) -> impl IntoElement {
         let hint = |keys: &[&str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
@@ -5789,11 +5847,27 @@ impl ReviewApp {
             .child(hint(&[&format!("{MOD}-j")], "chat"))
             .child(hint(&["r"], "refresh"))
             .child(hint(&[&format!("{MOD}-enter")], "review"))
+            .when_some(self.font_warning.clone(), |footer, warning| {
+                footer.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .text_color(theme::peach())
+                        .child(
+                            div()
+                                .text_color(theme::peach())
+                                .child(SharedString::from("⚠")),
+                        )
+                        .child(div().child(warning)),
+                )
+            })
     }
 }
 
 impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.check_font_fallback();
         let entity = cx.entity();
         let pane: gpui::AnyElement = match self.active_item() {
             None => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
@@ -5816,8 +5890,8 @@ impl Render for ReviewApp {
                     .size_full()
                     .relative()
                     .flex()
-                    .font_family(MONO)
-                    .text_size(px(TEXT_SIZE))
+                    .font_family(self.mono_family.clone())
+                    .text_size(px(self.mono_text_size))
                     .line_height(px(ROW_HEIGHT))
                     // Selection mouse listeners live on the diff pane only.
                     // While the palette is open its occluding backdrop keeps
