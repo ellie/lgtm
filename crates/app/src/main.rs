@@ -5799,7 +5799,14 @@ impl ReviewApp {
         let Some(resolved) = config::fc_match(&self.mono_family) else {
             return;
         };
-        if resolved.eq_ignore_ascii_case(&self.mono_family) {
+        // fc-match returns a comma-separated list of family aliases when the
+        // requested family matched. If any alias equals (case-insensitive) the
+        // user's request, fontconfig found it and we don't warn.
+        let requested_lower = self.mono_family.to_ascii_lowercase();
+        let matched = resolved
+            .split(',')
+            .any(|alias| alias.trim().to_ascii_lowercase() == requested_lower);
+        if matched {
             return;
         }
         self.font_warning = Some(

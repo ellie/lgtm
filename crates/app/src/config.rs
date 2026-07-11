@@ -190,6 +190,7 @@ mod tests {
 /// which is the actual signal we want.
 pub fn fc_match(family: &str) -> Option<String> {
     let output = std::process::Command::new("fc-match")
+        .args(["-f", "%{family}\n"])
         .arg(family)
         .output()
         .ok()?;
@@ -197,14 +198,5 @@ pub fn fc_match(family: &str) -> Option<String> {
         return None;
     }
     let stdout = String::from_utf8(output.stdout).ok()?;
-    // Output format: "Family Name:style stuff" e.g. "DejaVu Sans Mono:style=Book"
-    Some(
-        stdout
-            .trim()
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string(),
-    )
+    Some(stdout.trim().to_string())
 }
