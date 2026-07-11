@@ -18,11 +18,19 @@ The app is unsigned, so on first launch macOS will complain — right-click the 
 xattr -d com.apple.quarantine /Applications/LGTM.app
 ```
 
-Or build from source:
+### Build from source
 
 ```sh
 cargo run --release
 ```
+
+GPUI supports macOS and Linux natively. On Linux you'll need a few system libraries:
+
+- Debian/Ubuntu: `sudo apt install libxcb1 libxkbcommon-x11-0 libfontconfig1`
+- Fedora: `sudo dnf install libxcb libxkbcommon-x11 fontconfig`
+- Arch: `sudo pacman -S libxcb libxkbcommon-x11 fontconfig`
+
+The monospace font falls back from Menlo (macOS) to DejaVu Sans Mono on Linux automatically. Modifier keys also remap: `cmd-*` on macOS, `ctrl-*` on Linux.
 
 ## Features
 - unified + split views

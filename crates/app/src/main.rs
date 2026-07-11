@@ -28,7 +28,18 @@ use gpui_component::{
 use std::ops::Range;
 use std::path::Path;
 
-const MONO: &str = "Menlo";
+/// Monospace family: macOS ships Menlo by default, Linux boxes usually don't
+/// have it. On Linux we ask for DejaVu Sans Mono (almost always present) and
+/// let fontconfig fall back to whatever monospace is installed otherwise.
+const MONO: &str = if cfg!(target_os = "macos") {
+    "Menlo"
+} else {
+    "DejaVu Sans Mono"
+};
+/// Primary modifier: cmd on macOS, ctrl elsewhere. The GPUI `Keystroke` parser
+/// accepts both names, but `cmd` is the macOS super key and doesn't fire on
+/// Linux under default bindings, so we have to remap.
+const MOD: &str = if cfg!(target_os = "macos") { "cmd" } else { "ctrl" };
 const ROW_HEIGHT: f32 = 22.0;
 const TEXT_SIZE: f32 = 13.0;
 
@@ -92,7 +103,7 @@ fn main() {
                 KeyBinding::new("c", ToggleComments, Some("ReviewApp")),
                 KeyBinding::new("r", Refresh, Some("ReviewApp")),
                 // Finish the review: approve / request changes / comment.
-                KeyBinding::new("cmd-enter", SubmitReview, Some("ReviewApp")),
+                KeyBinding::new(&format!("{MOD}-enter"), SubmitReview, Some("ReviewApp")),
                 // Only while the diff pane has focus; typing `/` in any input
                 // stays a plain character.
                 KeyBinding::new("/", FocusTreeFilter, Some("ReviewApp")),
@@ -100,16 +111,16 @@ fn main() {
                 // focus; with the palette open its input has focus, so the
                 // palette's own escape routing wins by construction.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
-                KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new(&format!("{MOD}-c"), CopySelection, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
-                KeyBinding::new("cmd-b", ToggleSidebar, None),
-                KeyBinding::new("cmd-j", ToggleChat, None),
-                KeyBinding::new("cmd-t", OpenInput, None),
-                KeyBinding::new("cmd-w", CloseItem, None),
-                KeyBinding::new("cmd-k", OpenPalette, None),
-                KeyBinding::new("cmd-q", Quit, None),
+                KeyBinding::new(&format!("{MOD}-b"), ToggleSidebar, None),
+                KeyBinding::new(&format!("{MOD}-j"), ToggleChat, None),
+                KeyBinding::new(&format!("{MOD}-t"), OpenInput, None),
+                KeyBinding::new(&format!("{MOD}-w"), CloseItem, None),
+                KeyBinding::new(&format!("{MOD}-k"), OpenPalette, None),
+                KeyBinding::new(&format!("{MOD}-q"), Quit, None),
                 // Palette navigation. The `Palette > Input` variants are bound
                 // after gpui_component::init, so at the input's dispatch depth
                 // they take precedence over the Input's own up/down (which a
@@ -5772,12 +5783,12 @@ impl ReviewApp {
             .child(hint(&["c"], "comments"))
             .child(hint(&["/"], "filter files"))
             .child(hint(&["home", "end"], "top/bottom"))
-            .child(hint(&["cmd-k"], "palette"))
-            .child(hint(&["cmd-t"], "open"))
-            .child(hint(&["cmd-b"], "sidebar"))
-            .child(hint(&["cmd-j"], "chat"))
+            .child(hint(&[&format!("{MOD}-k")], "palette"))
+            .child(hint(&[&format!("{MOD}-t")], "open"))
+            .child(hint(&[&format!("{MOD}-b")], "sidebar"))
+            .child(hint(&[&format!("{MOD}-j")], "chat"))
             .child(hint(&["r"], "refresh"))
-            .child(hint(&["cmd-enter"], "review"))
+            .child(hint(&[&format!("{MOD}-enter")], "review"))
     }
 }
 
