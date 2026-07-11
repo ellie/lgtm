@@ -1,4 +1,4 @@
-name: Release DMG
+name: Release
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-dmg
+  group: release
   cancel-in-progress: true
 
 jobs:
@@ -72,3 +72,43 @@ jobs:
             gh release create latest --prerelease --title "Latest build" --notes ""
           gh release edit latest --notes "Automated build from \`${GITHUB_SHA::7}\`"
           gh release upload latest LGTM.dmg --clobber
+
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ubuntu-24.04 ships libxcb1, libxkbcommon-x11-0 and libfontconfig1 already,
+      # matching the Debian/Ubuntu line the README recommends. No apt install needed.
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Strip binary
+        run: strip --strip-unneeded target/release/lgtm
+
+      - name: Package
+        run: |
+          mkdir -p dist/lgtm-linux-x86_64
+          cp target/release/lgtm dist/lgtm-linux-x86_64/lgtm
+          cp README.md dist/lgtm-linux-x86_64/README.md
+          tar -C dist -czf lgtm-linux-x86_64.tar.gz lgtm-linux-x86_64
+
+      - name: Upload to latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # Uses --clobber, which only overwrites the file with the same name, so
+          # the macOS job's LGTM.dmg and this job's lgtm-linux-x86_64.tar.gz can
+          # upload in parallel without fighting over the release.
+        run: |
+          gh release view latest >/dev/null 2>&1 || \
+            gh release create latest --prerelease --title "Latest build" --notes ""
+          gh release upload latest lgtm-linux-x86_64.tar.gz --clobber
