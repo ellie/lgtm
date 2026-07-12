@@ -192,7 +192,10 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
         &["diff", "-M", "--no-color", "--no-ext-diff", &base],
     )?;
 
-    let untracked = git(&src.repo_root, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = git(
+        &src.repo_root,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
     for file in untracked.lines().take(MAX_UNTRACKED_FILES) {
         // `--no-index` against /dev/null renders an untracked file as an
         // added-file diff; it exits 1 when the sides differ, which is success
@@ -200,7 +203,14 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
         let output = Command::new("git")
             .arg("-C")
             .arg(&src.repo_root)
-            .args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null"])
+            .args([
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+            ])
             .arg(file)
             .output()
             .map_err(|err| anyhow!("failed to run git: {err}"))?;
@@ -273,7 +283,10 @@ mod tests {
         fs::write(dir.join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
 
         let src = resolve_local(dir).unwrap();
-        assert_eq!(src.repo_root.canonicalize().unwrap(), dir.canonicalize().unwrap());
+        assert_eq!(
+            src.repo_root.canonicalize().unwrap(),
+            dir.canonicalize().unwrap()
+        );
         assert_eq!(src.branch, "main");
         assert_eq!(src.base_label, "HEAD");
 
@@ -284,9 +297,18 @@ mod tests {
             .iter()
             .map(|f| (f.display_path(), f.status))
             .collect();
-        assert!(by_path.contains(&("a.rs", FileStatus::Modified)), "{by_path:?}");
-        assert!(by_path.contains(&("new.txt", FileStatus::Added)), "{by_path:?}");
-        assert!(by_path.contains(&("blob.bin", FileStatus::Binary)), "{by_path:?}");
+        assert!(
+            by_path.contains(&("a.rs", FileStatus::Modified)),
+            "{by_path:?}"
+        );
+        assert!(
+            by_path.contains(&("new.txt", FileStatus::Added)),
+            "{by_path:?}"
+        );
+        assert!(
+            by_path.contains(&("blob.bin", FileStatus::Binary)),
+            "{by_path:?}"
+        );
     }
 
     #[test]
@@ -373,7 +395,12 @@ mod tests {
         let clone = tmp.path().join("clone");
         run(
             tmp.path(),
-            &["git", "clone", upstream.to_str().unwrap(), clone.to_str().unwrap()],
+            &[
+                "git",
+                "clone",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
         );
         run(&clone, &["git", "config", "user.email", "test@example.com"]);
         run(&clone, &["git", "config", "user.name", "Test"]);
@@ -452,7 +479,10 @@ mod tests {
         assert!(src.base_oid.is_some());
 
         // Old side = committed content, not the working tree.
-        assert_eq!(file_at_base(&src, "a.rs").as_deref(), Some("fn main() {}\n"));
+        assert_eq!(
+            file_at_base(&src, "a.rs").as_deref(),
+            Some("fn main() {}\n")
+        );
         // Untracked: absent at base. Binary: non-UTF-8 → None.
         assert_eq!(file_at_base(&src, "new.txt"), None);
         assert_eq!(file_at_base(&src, "blob.bin"), None);
@@ -472,7 +502,12 @@ mod tests {
         let clone = tmp.path().join("clone");
         run(
             tmp.path(),
-            &["git", "clone", upstream.to_str().unwrap(), clone.to_str().unwrap()],
+            &[
+                "git",
+                "clone",
+                upstream.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
         );
         run(&clone, &["git", "config", "user.email", "test@example.com"]);
         run(&clone, &["git", "config", "user.name", "Test"]);
@@ -486,7 +521,10 @@ mod tests {
         let expected = git(&clone, &["merge-base", "HEAD", "origin/main"]).unwrap();
         assert_eq!(src.base_oid.as_deref(), Some(expected.trim()));
         // Old side comes from the merge-base commit, before the feature edit.
-        assert_eq!(file_at_base(&src, "lib.rs").as_deref(), Some("pub fn one() {}\n"));
+        assert_eq!(
+            file_at_base(&src, "lib.rs").as_deref(),
+            Some("pub fn one() {}\n")
+        );
     }
 
     #[test]

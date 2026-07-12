@@ -319,7 +319,12 @@ pub fn fetch_file_at(loc: &PrLocator, commit_oid: &str, path: &str) -> Result<Op
         commit_oid
     );
     let output = Command::new("gh")
-        .args(["api", "-H", "Accept: application/vnd.github.raw+json", &endpoint])
+        .args([
+            "api",
+            "-H",
+            "Accept: application/vnd.github.raw+json",
+            &endpoint,
+        ])
         .output()
         .map_err(|err| anyhow!("failed to run gh (is the GitHub CLI installed?): {err}"))?;
     if !output.status.success() {

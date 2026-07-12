@@ -7,16 +7,10 @@ use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, StyledText, Subscription, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, StyledText, Subscription, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Escape as InputEscape, Input, InputEvent, InputState},
@@ -25,8 +19,14 @@ use gpui_component::{
     tag::Tag,
     Disableable as _, IconName, Root, Sizable as _, TitleBar,
 };
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -42,10 +42,31 @@ const SPLIT_DIVIDER: f32 = 6.0;
 actions!(
     lgtm,
     [
-        NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
-        ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
-        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap,
-        ToggleComments, ToggleChat, SubmitReview
+        NextFile,
+        PrevFile,
+        NextHunk,
+        PrevHunk,
+        GoToTop,
+        GoToBottom,
+        ToggleView,
+        Quit,
+        ToggleSidebar,
+        OpenInput,
+        CloseItem,
+        NextItem,
+        PrevItem,
+        Refresh,
+        OpenPalette,
+        PaletteUp,
+        PaletteDown,
+        PaletteBack,
+        ClearSelection,
+        CopySelection,
+        FocusTreeFilter,
+        ToggleMinimap,
+        ToggleComments,
+        ToggleChat,
+        SubmitReview
     ]
 );
 
@@ -223,7 +244,9 @@ enum Row {
     },
     /// One soft-wrapped line of a comment body (wrapped at
     /// [`COMMENT_WRAP_CHARS`] when the rows are built).
-    CommentBody { line: SharedString },
+    CommentBody {
+        line: SharedString,
+    },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
     CommentActions {
@@ -540,8 +563,16 @@ fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Rang
     }
     let text = row_side_text(row, sel.side)?;
     let chars = text.chars().count();
-    let start_col = if row_ix == start.row { start.col.min(chars) } else { 0 };
-    let end_col = if row_ix == end.row { end.col.min(chars) } else { chars };
+    let start_col = if row_ix == start.row {
+        start.col.min(chars)
+    } else {
+        0
+    };
+    let end_col = if row_ix == end.row {
+        end.col.min(chars)
+    } else {
+        chars
+    };
     if start_col > end_col {
         return None;
     }
@@ -677,15 +708,27 @@ fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
         (1, 1)
     } else {
         let h = &hunks[gap_ix - 1];
-        let pre_old = if h.old_count == 0 { h.old_start } else { h.old_start - 1 };
-        let pre_new = if h.new_count == 0 { h.new_start } else { h.new_start - 1 };
+        let pre_old = if h.old_count == 0 {
+            h.old_start
+        } else {
+            h.old_start - 1
+        };
+        let pre_new = if h.new_count == 0 {
+            h.new_start
+        } else {
+            h.new_start - 1
+        };
         (pre_old + h.old_count + 1, pre_new + h.new_count + 1)
     };
     let new_hi = if gap_ix == hunks.len() {
         total_new
     } else {
         let h = &hunks[gap_ix];
-        if h.new_count == 0 { h.new_start } else { h.new_start - 1 }
+        if h.new_count == 0 {
+            h.new_start
+        } else {
+            h.new_start - 1
+        }
     };
     (old_lo, new_lo, (new_hi + 1).saturating_sub(new_lo))
 }
@@ -813,7 +856,15 @@ fn build_rows(
         for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
             if let Some(upgrade) = upgrade {
                 push_gap_rows(
-                    &mut rows, upgrade, &file.hunks, file_ix, hunk_ix, mode, path, anchors, now,
+                    &mut rows,
+                    upgrade,
+                    &file.hunks,
+                    file_ix,
+                    hunk_ix,
+                    mode,
+                    path,
+                    anchors,
+                    now,
                 );
             }
             let syntax_spans = match upgrade {
@@ -919,12 +970,20 @@ fn build_rows(
                                     }),
                                 });
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Left, Some(*old_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Left,
+                                    Some(*old_no),
+                                    now,
                                 );
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Right, Some(*new_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Right,
+                                    Some(*new_no),
+                                    now,
                                 );
                                 i += 1;
                             }
@@ -945,27 +1004,29 @@ fn build_rows(
                                     }),
                                 });
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Right, Some(*new_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Right,
+                                    Some(*new_no),
+                                    now,
                                 );
                                 i += 1;
                             }
                             DiffRow::Removed { .. } => {
                                 let start = i;
-                                while i < hrows.len()
-                                    && matches!(hrows[i], DiffRow::Removed { .. })
+                                while i < hrows.len() && matches!(hrows[i], DiffRow::Removed { .. })
                                 {
                                     i += 1;
                                 }
                                 let mid = i;
-                                while i < hrows.len() && matches!(hrows[i], DiffRow::Added { .. })
-                                {
+                                while i < hrows.len() && matches!(hrows[i], DiffRow::Added { .. }) {
                                     i += 1;
                                 }
                                 let (removed, added) = (mid - start, i - mid);
                                 for pair in 0..removed.max(added) {
-                                    let left = (pair < removed).then(|| {
-                                        match &hrows[start + pair] {
+                                    let left =
+                                        (pair < removed).then(|| match &hrows[start + pair] {
                                             DiffRow::Removed {
                                                 old_no,
                                                 text,
@@ -978,34 +1039,39 @@ fn build_rows(
                                                 syntax: syntax_spans[start + pair].clone(),
                                             },
                                             _ => unreachable!(),
-                                        }
-                                    });
-                                    let right = (pair < added).then(|| {
-                                        match &hrows[mid + pair] {
-                                            DiffRow::Added {
-                                                new_no,
-                                                text,
-                                                intra,
-                                            } => Cell {
-                                                no: *new_no,
-                                                kind: LineKind::Added,
-                                                text: text.clone().into(),
-                                                intra: intra.clone(),
-                                                syntax: syntax_spans[mid + pair].clone(),
-                                            },
-                                            _ => unreachable!(),
-                                        }
+                                        });
+                                    let right = (pair < added).then(|| match &hrows[mid + pair] {
+                                        DiffRow::Added {
+                                            new_no,
+                                            text,
+                                            intra,
+                                        } => Cell {
+                                            no: *new_no,
+                                            kind: LineKind::Added,
+                                            text: text.clone().into(),
+                                            intra: intra.clone(),
+                                            syntax: syntax_spans[mid + pair].clone(),
+                                        },
+                                        _ => unreachable!(),
                                     });
                                     let left_no = left.as_ref().map(|cell| cell.no);
                                     let right_no = right.as_ref().map(|cell| cell.no);
                                     rows.push(Row::SplitLine { left, right });
                                     push_thread_rows(
-                                        &mut rows, anchors, path,
-                                        CommentSide::Left, left_no, now,
+                                        &mut rows,
+                                        anchors,
+                                        path,
+                                        CommentSide::Left,
+                                        left_no,
+                                        now,
                                     );
                                     push_thread_rows(
-                                        &mut rows, anchors, path,
-                                        CommentSide::Right, right_no, now,
+                                        &mut rows,
+                                        anchors,
+                                        path,
+                                        CommentSide::Right,
+                                        right_no,
+                                        now,
                                     );
                                 }
                             }
@@ -1016,7 +1082,14 @@ fn build_rows(
         }
         if let Some(upgrade) = upgrade {
             push_gap_rows(
-                &mut rows, upgrade, &file.hunks, file_ix, file.hunks.len(), mode, path, anchors,
+                &mut rows,
+                upgrade,
+                &file.hunks,
+                file_ix,
+                file.hunks.len(),
+                mode,
+                path,
+                anchors,
                 now,
             );
         }
@@ -1026,7 +1099,14 @@ fn build_rows(
 }
 
 /// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
-fn kind_style(kind: LineKind) -> (Option<gpui::Rgba>, Option<gpui::Rgba>, &'static str, gpui::Rgba) {
+fn kind_style(
+    kind: LineKind,
+) -> (
+    Option<gpui::Rgba>,
+    Option<gpui::Rgba>,
+    &'static str,
+    gpui::Rgba,
+) {
     match kind {
         LineKind::Context => (None, None, "", theme::overlay0()),
         LineKind::Added => (
@@ -1100,9 +1180,7 @@ fn merge_highlights(
         }
         match out.last_mut() {
             // Coalesce adjacent identically-styled segments.
-            Some((prev, prev_style)) if prev.end == start && *prev_style == style => {
-                prev.end = end
-            }
+            Some((prev, prev_style)) if prev.end == start && *prev_style == style => prev.end = end,
             _ => out.push((start..end, style)),
         }
     }
@@ -1301,7 +1379,10 @@ fn render_row(
             if *comments > 0 || *outdated > 0 {
                 let mut note = String::new();
                 if *comments > 0 {
-                    note = format!("{comments} comment{}", if *comments == 1 { "" } else { "s" });
+                    note = format!(
+                        "{comments} comment{}",
+                        if *comments == 1 { "" } else { "s" }
+                    );
                 }
                 if *outdated > 0 {
                     if !note.is_empty() {
@@ -1389,15 +1470,13 @@ fn render_row(
                         .text_color(marker_color)
                         .child(SharedString::from(marker)),
                 )
-                .child(
-                    div().whitespace_nowrap().child(line_content(
-                        text,
-                        syntax,
-                        intra,
-                        word_bg,
-                        selection.map(|(_, range)| range),
-                    )),
-                )
+                .child(div().whitespace_nowrap().child(line_content(
+                    text,
+                    syntax,
+                    intra,
+                    word_bg,
+                    selection.map(|(_, range)| range),
+                )))
                 .into_any_element()
         }
         Row::SplitLine { left, right } => {
@@ -1550,9 +1629,8 @@ fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
                 len_frac: line_frac(text),
             },
             Row::SplitLine { left, right } => {
-                let frac = |cell: &Option<Cell>| {
-                    cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.)
-                };
+                let frac =
+                    |cell: &Option<Cell>| cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.);
                 let (left_frac, right_frac) = (frac(left), frac(right));
                 MinimapRow {
                     kind: MinimapKind::SplitPair {
@@ -1652,9 +1730,9 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
         for row in chunk {
             let mut fold = |lane: MinimapLane, color: MinimapColor, f: f32| {
                 let ix = lane as usize;
-                if winner[ix]
-                    .map_or(true, |best| minimap_priority(color) > minimap_priority(best))
-                {
+                if winner[ix].map_or(true, |best| {
+                    minimap_priority(color) > minimap_priority(best)
+                }) {
                     winner[ix] = Some(color);
                 }
                 frac[ix] = frac[ix].max(f);
@@ -1727,7 +1805,11 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
             });
         }
     }
-    MinimapLayout { slot_h, group, runs }
+    MinimapLayout {
+        slot_h,
+        group,
+        runs,
+    }
 }
 
 // --- Sidebar file tree ---------------------------------------------------
@@ -1922,7 +2004,11 @@ fn render_tree_row(
             });
             match &entry.kind {
                 TreeEntryKind::Dir { path } => {
-                    let chevron = if data.collapsed.contains(path) { "▸" } else { "▾" };
+                    let chevron = if data.collapsed.contains(path) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
                     base.child(
                         div()
                             .w(px(12.))
@@ -2074,10 +2160,11 @@ impl ItemData {
         self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         let new_top = nth_noncomment_row(&self.rows, top_base);
-        self.scroll.0.borrow().base_handle.set_offset(point(
-            offset.x,
-            px(-(new_top as f32 * ROW_HEIGHT + frac)),
-        ));
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(offset.x, px(-(new_top as f32 * ROW_HEIGHT + frac))));
     }
 
     /// The minimap quad runs for this pane height, from the cache when the
@@ -2300,7 +2387,8 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
+    let (rows, file_rows, hunk_rows) =
+        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
     Ok(Loaded {
         meta,
         diff,
@@ -2386,7 +2474,11 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
 /// binary/non-UTF-8, over the size cap, or a fetch failure.
 fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
     let text = match source {
-        UpgradeSource::Pr { loc, base_oid, head_oid } => {
+        UpgradeSource::Pr {
+            loc,
+            base_oid,
+            head_oid,
+        } => {
             let oid = if old { base_oid } else { head_oid };
             match gh::fetch_file_at(loc, oid, path) {
                 Ok(text) => text?,
@@ -2434,14 +2526,15 @@ fn upgrade_file(source: &UpgradeSource, job: &UpgradeJob) -> Option<UpgradedFile
     let new_text = normalize(new_text);
 
     let hunks = diff_texts(&old_text, &new_text, 3);
-    let (additions, deletions) = hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .fold((0, 0), |(a, d), row| match row {
-            DiffRow::Added { .. } => (a + 1, d),
-            DiffRow::Removed { .. } => (a, d + 1),
-            DiffRow::Context { .. } => (a, d),
-        });
+    let (additions, deletions) =
+        hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .fold((0, 0), |(a, d), row| match row {
+                DiffRow::Added { .. } => (a + 1, d),
+                DiffRow::Removed { .. } => (a, d + 1),
+                DiffRow::Context { .. } => (a, d),
+            });
 
     let path = job.new_path.as_deref().or(job.old_path.as_deref())?;
     let lang = syntax::language_for_path(path);
@@ -2565,9 +2658,14 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(div().text_color(theme::overlay0()).child(SharedString::from(
-                    format!("{} ← {}", meta.base_ref_name, meta.head_ref_name),
-                )))
+                .child(
+                    div()
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(format!(
+                            "{} ← {}",
+                            meta.base_ref_name, meta.head_ref_name
+                        ))),
+                )
                 .child(
                     div()
                         .text_color(theme::green())
@@ -2740,7 +2838,9 @@ fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
                 "#{} {} {} {}",
                 pr.number, pr.title, pr.author.login, pr.head_ref_name
             );
-            matcher.fuzzy_match(&haystack, query).map(|score| (score, ix))
+            matcher
+                .fuzzy_match(&haystack, query)
+                .map(|score| (score, ix))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -2983,7 +3083,11 @@ fn local_chat_header(src: &git::LocalSource) -> String {
 /// The full prompt for one turn. `context` (header + raw patch) is only
 /// present on a session's first message; the patch is capped at
 /// [`MAX_CHAT_PATCH_BYTES`] with the truncation noted in the prompt.
-fn chat_prompt(context: Option<(&str, &str)>, selection_block: Option<&str>, question: &str) -> String {
+fn chat_prompt(
+    context: Option<(&str, &str)>,
+    selection_block: Option<&str>,
+    question: &str,
+) -> String {
     let mut out = String::new();
     if let Some((header, patch)) = context {
         out.push_str(header);
@@ -3027,7 +3131,10 @@ impl SelectionInfo {
     }
 
     fn note(&self) -> String {
-        format!("› included selection: {}:{}-{}", self.path, self.lo, self.hi)
+        format!(
+            "› included selection: {}:{}-{}",
+            self.path, self.lo, self.hi
+        )
     }
 }
 
@@ -3072,7 +3179,13 @@ fn selection_info(
         SelSide::Left => "LEFT (old)",
         SelSide::Right => "RIGHT (new)",
     };
-    Some(SelectionInfo { path, side, lo, hi, text })
+    Some(SelectionInfo {
+        path,
+        side,
+        lo,
+        hi,
+        text,
+    })
 }
 
 /// Scratch dir for one item's materialized exploration files. Includes the
@@ -3206,8 +3319,8 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let open_input = cx
-            .new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
+        let open_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let palette_input = cx.new(|cx| InputState::new(window, cx));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
@@ -3554,10 +3667,9 @@ impl ReviewApp {
             // offset.y is negative when scrolled down.
             let top_row = (f32::from(-offset.y) / ROW_HEIGHT).floor() as usize;
             if gap_row < top_row {
-                scroll.base_handle.set_offset(point(
-                    offset.x,
-                    offset.y - px(inserted as f32 * ROW_HEIGHT),
-                ));
+                scroll
+                    .base_handle
+                    .set_offset(point(offset.x, offset.y - px(inserted as f32 * ROW_HEIGHT)));
             }
         }
         cx.notify();
@@ -3647,7 +3759,10 @@ impl ReviewApp {
                 }
             }
             Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { filtered, selected, .. },
+                prs:
+                    PrListState::Loaded {
+                        filtered, selected, ..
+                    },
                 ..
             }) => {
                 if !filtered.is_empty() {
@@ -3682,7 +3797,12 @@ impl ReviewApp {
             }
             Some(PaletteStep::RepoInput { error }) => *error = None,
             Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { all, filtered, selected },
+                prs:
+                    PrListState::Loaded {
+                        all,
+                        filtered,
+                        selected,
+                    },
                 ..
             }) => {
                 *filtered = filter_prs(all, &query);
@@ -4060,7 +4180,10 @@ impl ReviewApp {
     /// Jump the diff to `file_ix`'s header row and hand focus to the diff
     /// pane (like clicking a sidebar item does).
     fn jump_to_file(&mut self, file_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(&row) = self.active_data().and_then(|data| data.file_rows.get(file_ix)) else {
+        let Some(&row) = self
+            .active_data()
+            .and_then(|data| data.file_rows.get(file_ix))
+        else {
             return;
         };
         window.focus(&self.focus_handle);
@@ -4229,15 +4352,12 @@ impl ReviewApp {
         // cmd-enter: the input's own `secondary-enter` binding emits
         // PressEnter { secondary: true } (after inserting a newline, which
         // submit trims away).
-        let _subscription = cx.subscribe_in(
-            &input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
+        let _subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: true }) {
                     this.submit_composer(window, cx);
                 }
-            },
-        );
+            });
         input.update(cx, |state, cx| state.focus(window, cx));
         self.composer = Some(Composer {
             item_id,
@@ -4389,15 +4509,12 @@ impl ReviewApp {
                 .auto_grow(3, 8)
                 .placeholder("leave a review comment… (optional when approving)")
         });
-        let _subscription = cx.subscribe_in(
-            &input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
+        let _subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: true }) {
                     this.submit_review(window, cx);
                 }
-            },
-        );
+            });
         input.update(cx, |state, cx| state.focus(window, cx));
         self.review = Some(ReviewDialog {
             item_id,
@@ -4486,7 +4603,9 @@ impl ReviewApp {
     /// without reloading the whole diff.
     fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let fetched = cx.background_spawn(async move { gh::fetch_meta(&loc) }).await;
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_meta(&loc) })
+                .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
@@ -4907,14 +5026,11 @@ impl ReviewApp {
             )
             .child(div().flex_1());
         if chat.in_flight {
-            header = header.child(
-                Button::new("chat-stop")
-                    .label("Stop")
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cancel_chat(cx);
-                    })),
-            );
+            header = header.child(Button::new("chat-stop").label("Stop").small().on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.cancel_chat(cx);
+                }),
+            ));
         }
 
         let mut column = div().w_full().flex().flex_col().gap_3().p_3();
@@ -4923,8 +5039,8 @@ impl ReviewApp {
                 div()
                     .text_color(theme::overlay0())
                     .child(SharedString::from(
-                        "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
-                    )),
+                    "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
+                )),
             );
         }
         let last = chat.messages.len().saturating_sub(1);
@@ -4959,7 +5075,11 @@ impl ReviewApp {
                     }
                     let mut wrap = div().w_full().min_w_0().flex().flex_col().gap_1().child(
                         div()
-                            .text_color(if msg.error { theme::red() } else { theme::text() })
+                            .text_color(if msg.error {
+                                theme::red()
+                            } else {
+                                theme::text()
+                            })
                             .child(SharedString::from(text)),
                     );
                     if let Some(cost) = msg.cost {
@@ -5001,7 +5121,12 @@ impl ReviewApp {
         let sel_hint = data
             .selection
             .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff))
-            .map(|info| format!("will include selection {}:{}-{}", info.path, info.lo, info.hi));
+            .map(|info| {
+                format!(
+                    "will include selection {}:{}-{}",
+                    info.path, info.lo, info.hi
+                )
+            });
         let mut input_area = div()
             .p_2()
             .flex_shrink_0()
@@ -5064,7 +5189,10 @@ impl ReviewApp {
             return None;
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
-        let file_ix = data.file_rows.iter().rposition(|&header| header <= row_ix)?;
+        let file_ix = data
+            .file_rows
+            .iter()
+            .rposition(|&header| header <= row_ix)?;
         let path = data.diff.files[file_ix].display_path().to_string();
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
@@ -5098,16 +5226,13 @@ impl ReviewApp {
                 .text_size(px(13.))
                 .cursor_pointer()
                 .child(SharedString::from("+"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    move |_, window, cx| {
-                        cx.stop_propagation();
-                        let path = path.clone();
-                        entity.update(cx, |this, cx| {
-                            this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
-                        });
-                    },
-                )
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    let path = path.clone();
+                    entity.update(cx, |this, cx| {
+                        this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                    });
+                })
                 .into_any_element(),
         )
     }
@@ -5134,8 +5259,7 @@ impl ReviewApp {
         let pane_h = f32::from(bounds.size.height);
         let row_y = composer.row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
         let y = f32::from(bounds.top()) + (row_y + ROW_HEIGHT).clamp(8., (pane_h - 250.).max(8.));
-        let x = (f32::from(bounds.left()) + 72.)
-            .min((f32::from(bounds.right()) - 528.).max(8.));
+        let x = (f32::from(bounds.left()) + 72.).min((f32::from(bounds.right()) - 528.).max(8.));
         let action = if composer.reply_to.is_some() {
             "Reply"
         } else {
@@ -5143,7 +5267,11 @@ impl ReviewApp {
         };
         let target = format!(
             "{}{}:{} ({})",
-            if composer.reply_to.is_some() { "reply · " } else { "" },
+            if composer.reply_to.is_some() {
+                "reply · "
+            } else {
+                ""
+            },
             composer.path,
             composer.line,
             composer.side.api_str()
@@ -5230,34 +5358,35 @@ impl ReviewApp {
             return empty();
         }
         let selected = review.verdict;
-        let verdict_option = |label: &'static str, verdict: gh::ReviewVerdict, color: gpui::Rgba| {
-            let tint: Hsla = color.into();
-            div()
-                .id(label)
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .cursor_pointer()
-                .when(verdict == selected, |opt| {
-                    opt.bg(tint.opacity(0.15))
-                        .border_color(tint.opacity(0.6))
-                        .text_color(color)
-                })
-                .when(verdict != selected, |opt| {
-                    opt.border_color(theme::surface0())
-                        .text_color(theme::subtext())
-                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(review) = &mut this.review {
-                        review.verdict = verdict;
-                        review.error = None;
-                        cx.notify();
-                    }
-                }))
-                .child(SharedString::from(label))
-        };
+        let verdict_option =
+            |label: &'static str, verdict: gh::ReviewVerdict, color: gpui::Rgba| {
+                let tint: Hsla = color.into();
+                div()
+                    .id(label)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .cursor_pointer()
+                    .when(verdict == selected, |opt| {
+                        opt.bg(tint.opacity(0.15))
+                            .border_color(tint.opacity(0.6))
+                            .text_color(color)
+                    })
+                    .when(verdict != selected, |opt| {
+                        opt.border_color(theme::surface0())
+                            .text_color(theme::subtext())
+                            .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(review) = &mut this.review {
+                            review.verdict = verdict;
+                            review.error = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(SharedString::from(label))
+            };
         let submit_label = match selected {
             gh::ReviewVerdict::Approve => "Approve",
             gh::ReviewVerdict::RequestChanges => "Request changes",
@@ -5308,13 +5437,21 @@ impl ReviewApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(verdict_option("approve", gh::ReviewVerdict::Approve, theme::green()))
+                            .child(verdict_option(
+                                "approve",
+                                gh::ReviewVerdict::Approve,
+                                theme::green(),
+                            ))
                             .child(verdict_option(
                                 "request changes",
                                 gh::ReviewVerdict::RequestChanges,
                                 theme::red(),
                             ))
-                            .child(verdict_option("comment", gh::ReviewVerdict::Comment, theme::blue())),
+                            .child(verdict_option(
+                                "comment",
+                                gh::ReviewVerdict::Comment,
+                                theme::blue(),
+                            )),
                     )
                     .child(Input::new(&review.input))
                     .when_some(review.error.clone(), |card, err| {
@@ -5428,8 +5565,7 @@ impl ReviewApp {
                             ));
                         }
                         // Viewport indicator — the only per-frame math.
-                        let offset_y =
-                            f32::from(-data.scroll.0.borrow().base_handle.offset().y);
+                        let offset_y = f32::from(-data.scroll.0.borrow().base_handle.offset().y);
                         let px_per_row = layout.slot_h / layout.group as f32;
                         let top_row = offset_y / ROW_HEIGHT;
                         let visible = (pane_h / ROW_HEIGHT).min(total as f32 - top_row);
@@ -5626,9 +5762,7 @@ impl ReviewApp {
             let scroll = data.scroll.0.borrow();
             let top_row = match &scroll.deferred_scroll_to_item {
                 Some(deferred) => deferred.item_index,
-                None => {
-                    (f32::from(-scroll.base_handle.offset().y) / ROW_HEIGHT).max(0.) as usize
-                }
+                None => (f32::from(-scroll.base_handle.offset().y) / ROW_HEIGHT).max(0.) as usize,
             };
             drop(scroll);
             current_file = data.file_rows.iter().rposition(|&ix| ix <= top_row);
@@ -5701,12 +5835,7 @@ impl ReviewApp {
                     .gap_1()
                     .child(Input::new(&self.open_input).small())
                     .when_some(self.open_error.clone(), |area, err| {
-                        area.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme::red())
-                                .child(err),
-                        )
+                        area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
                     }),
             )
             .child(list)
@@ -5726,7 +5855,11 @@ impl ReviewApp {
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }))
-                    .child(div().p_2().child(Input::new(&self.tree_filter_input).small()))
+                    .child(
+                        div()
+                            .p_2()
+                            .child(Input::new(&self.tree_filter_input).small()),
+                    )
                     .child(div().flex_1().min_h_0().child(tree_list)),
             )
     }
@@ -5831,7 +5964,12 @@ impl ReviewApp {
                             uniform_list("palette-prs", count, move |range, _window, cx| {
                                 let this = entity.read(cx);
                                 let Some(PaletteStep::PrList {
-                                    prs: PrListState::Loaded { all, filtered, selected },
+                                    prs:
+                                        PrListState::Loaded {
+                                            all,
+                                            filtered,
+                                            selected,
+                                        },
                                     ..
                                 }) = &this.palette
                                 else {
@@ -5973,19 +6111,15 @@ impl ReviewApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.palette_move(-1, cx)))
                     .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.palette_move(1, cx)))
-                    .on_action(
-                        cx.listener(|this, _: &PaletteBack, window, cx| {
-                            this.palette_back(window, cx)
-                        }),
-                    )
+                    .on_action(cx.listener(|this, _: &PaletteBack, window, cx| {
+                        this.palette_back(window, cx)
+                    }))
                     // The palette input propagates Escape when it has nothing
                     // of its own to dismiss; intercept it here before the
                     // root's handler steals focus back to the diff.
-                    .on_action(
-                        cx.listener(|this, _: &InputEscape, window, cx| {
-                            this.palette_back(window, cx)
-                        }),
-                    )
+                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                        this.palette_back(window, cx)
+                    }))
                     .w(px(560.))
                     .rounded_lg()
                     .border_1()
@@ -6127,7 +6261,8 @@ impl Render for ReviewApp {
                         else {
                             return;
                         };
-                        let selection = (head != anchor).then_some(Selection { side, anchor, head });
+                        let selection =
+                            (head != anchor).then_some(Selection { side, anchor, head });
                         if let Some(data) = this.active_data_mut() {
                             if data.selection != selection {
                                 data.selection = selection;
@@ -6209,19 +6344,31 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| {
-                let targets = this.active_data().map(|d| d.file_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.file_rows.clone())
+                    .unwrap_or_default();
                 this.jump_next(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| {
-                let targets = this.active_data().map(|d| d.file_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.file_rows.clone())
+                    .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
-                let targets = this.active_data().map(|d| d.hunk_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.hunk_rows.clone())
+                    .unwrap_or_default();
                 this.jump_next(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
-                let targets = this.active_data().map(|d| d.hunk_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.hunk_rows.clone())
+                    .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
@@ -6245,9 +6392,7 @@ impl Render for ReviewApp {
                     this.open_review(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| {
-                this.toggle_chat(window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -6501,7 +6646,8 @@ mod tests {
 
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
-        let (rows, _, hunk_rows) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let (rows, _, hunk_rows) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         let h2 = hunk_rows[1];
         // 2 removed / 1 added: first row paired, second left-only.
         match &rows[h2 + 1] {
@@ -6595,7 +6741,11 @@ mod tests {
             let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true);
             // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
             match &rows[1] {
-                Row::Gap { file_ix, gap_ix, hidden } => {
+                Row::Gap {
+                    file_ix,
+                    gap_ix,
+                    hidden,
+                } => {
                     assert_eq!((*file_ix, *gap_ix, *hidden), (0, 0, 6));
                 }
                 other => panic!("expected leading gap, got {}", row_name(other)),
@@ -6613,7 +6763,13 @@ mod tests {
         // Un-upgraded build of the same diff has no gap rows.
         let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
-        assert!(matches!(rows[1], Row::HunkHeader { upgraded: false, .. }));
+        assert!(matches!(
+            rows[1],
+            Row::HunkHeader {
+                upgraded: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6626,7 +6782,13 @@ mod tests {
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
             match row {
-                Row::Line { old_no, new_no, kind, text, .. } => {
+                Row::Line {
+                    old_no,
+                    new_no,
+                    kind,
+                    text,
+                    ..
+                } => {
                     assert_eq!(*kind, LineKind::Context);
                     assert_eq!(*old_no, Some(j as u32 + 1));
                     assert_eq!(*new_no, Some(j as u32 + 1));
@@ -6656,7 +6818,12 @@ mod tests {
         let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
-            Row::Line { old_no, new_no, text, .. } => {
+            Row::Line {
+                old_no,
+                new_no,
+                text,
+                ..
+            } => {
                 assert_eq!((*old_no, *new_no), (Some(20), Some(20)));
                 assert_eq!(text.as_ref(), "line 20");
             }
@@ -6681,7 +6848,10 @@ mod tests {
         let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
         assert_eq!(
             merge_highlights(&syntax, &[], None, None),
-            vec![(0..2, style(Token::Keyword)), (3..7, style(Token::Function))]
+            vec![
+                (0..2, style(Token::Keyword)),
+                (3..7, style(Token::Function))
+            ]
         );
     }
 
@@ -6989,7 +7159,10 @@ mod tests {
         // Unified emits one row per diff row; split collapses the equal run.
         let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
         let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true);
-        let unified_lines = unified.iter().filter(|r| matches!(r, Row::Line { .. })).count();
+        let unified_lines = unified
+            .iter()
+            .filter(|r| matches!(r, Row::Line { .. }))
+            .count();
         let split_lines = split
             .iter()
             .filter(|r| matches!(r, Row::SplitLine { .. }))
@@ -7026,8 +7199,14 @@ mod tests {
     fn sel(side: SelSide, anchor: (usize, usize), head: (usize, usize)) -> Selection {
         Selection {
             side,
-            anchor: RowCol { row: anchor.0, col: anchor.1 },
-            head: RowCol { row: head.0, col: head.1 },
+            anchor: RowCol {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            head: RowCol {
+                row: head.0,
+                col: head.1,
+            },
         }
     }
 
@@ -7049,7 +7228,10 @@ mod tests {
         assert_eq!(char_to_byte(text, 10), 10); // 'é'
         assert_eq!(char_to_byte(text, 11), 12); // first 'l': 'é' is 2 bytes
         assert_eq!(char_to_byte(text, 99), text.len()); // clamped
-        assert_eq!(&text[char_to_byte(text, 8)..char_to_byte(text, 14)], "\"héllo");
+        assert_eq!(
+            &text[char_to_byte(text, 8)..char_to_byte(text, 14)],
+            "\"héllo"
+        );
     }
 
     #[test]
@@ -7068,13 +7250,19 @@ mod tests {
 
     #[test]
     fn row_range_skips_non_text_rows() {
-        let header = Row::HunkHeader { label: "@@".into(), upgraded: false };
+        let header = Row::HunkHeader {
+            label: "@@".into(),
+            upgraded: false,
+        };
         let sel = sel(SelSide::Unified, (0, 0), (2, 3));
         // Headers/spacers inside the span contribute nothing…
         assert_eq!(row_selection_range(&sel, 1, &header), None);
         assert_eq!(row_selection_range(&sel, 1, &Row::Spacer), None);
         // …and split rows never match a Unified-side selection.
-        assert_eq!(row_selection_range(&sel, 1, &split(Some("x"), Some("y"))), None);
+        assert_eq!(
+            row_selection_range(&sel, 1, &split(Some("x"), Some("y"))),
+            None
+        );
     }
 
     #[test]
@@ -7107,7 +7295,10 @@ mod tests {
     fn copy_assembles_contributing_rows() {
         let rows = vec![
             line("fn main() {"),
-            Row::HunkHeader { label: "@@".into(), upgraded: false },
+            Row::HunkHeader {
+                label: "@@".into(),
+                upgraded: false,
+            },
             line(""),
             line("    body();"),
             line("}"),
@@ -7115,7 +7306,10 @@ mod tests {
         // From col 3 of row 0 through col 1 of row 4: the header is skipped
         // (no blank line for it), the empty line survives as an empty line.
         let forward = sel(SelSide::Unified, (0, 3), (4, 1));
-        assert_eq!(selection_text(&forward, &rows), "main() {\n\n    body();\n}");
+        assert_eq!(
+            selection_text(&forward, &rows),
+            "main() {\n\n    body();\n}"
+        );
         // Backward drag over one row.
         let backward = sel(SelSide::Unified, (0, 7), (0, 3));
         assert_eq!(selection_text(&backward, &rows), "main");
@@ -7149,7 +7343,13 @@ mod tests {
 
     #[test]
     fn minimap_rows_unified_kinds_and_fracs() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // FileHeader and HunkHeader both map to Header ticks.
@@ -7159,7 +7359,7 @@ mod tests {
         assert_eq!(mm[2], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
         assert_eq!(mm[3], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
         assert_eq!(mm[5], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
-        // Spacer and Binary rows are blank.
+                                                                // Spacer and Binary rows are blank.
         assert_eq!(mm[14], mrow(MinimapKind::Blank, 0.));
         assert_eq!(mm[16], mrow(MinimapKind::Blank, 0.));
     }
@@ -7331,7 +7531,12 @@ mod tests {
     fn minimap_split_rows_use_half_lanes() {
         let pair = |left_frac: f32, right_frac: f32, left: bool, right: bool| {
             mrow(
-                MinimapKind::SplitPair { left_frac, right_frac, left, right },
+                MinimapKind::SplitPair {
+                    left_frac,
+                    right_frac,
+                    left,
+                    right,
+                },
                 left_frac.max(right_frac),
             )
         };
@@ -7445,19 +7650,91 @@ mod tests {
     fn group_comments_threads_replies_orphans_and_outdated() {
         let index = group_comments(vec![
             // Deliberately out of order: grouping sorts by created_at.
-            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
-            rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "alice", "2026-01-01T00:00:00Z", None),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "root",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
             // Second thread at the same anchor, created later.
-            rc(3, "a.rs", Some("RIGHT"), Some(2), "later", "carol", "2026-01-03T00:00:00Z", None),
+            rc(
+                3,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "later",
+                "carol",
+                "2026-01-03T00:00:00Z",
+                None,
+            ),
             // LEFT-side thread on the same line number: distinct anchor.
-            rc(4, "a.rs", Some("LEFT"), Some(2), "old side", "dave", "2026-01-04T00:00:00Z", None),
+            rc(
+                4,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "old side",
+                "dave",
+                "2026-01-04T00:00:00Z",
+                None,
+            ),
             // Outdated: no current line. Counts, never anchors.
-            rc(5, "a.rs", None, None, "stale", "erin", "2026-01-05T00:00:00Z", None),
+            rc(
+                5,
+                "a.rs",
+                None,
+                None,
+                "stale",
+                "erin",
+                "2026-01-05T00:00:00Z",
+                None,
+            ),
             // Orphaned reply: parent never fetched — dropped entirely.
-            rc(6, "a.rs", Some("RIGHT"), Some(2), "orphan", "mallory", "2026-01-06T00:00:00Z", Some(999)),
+            rc(
+                6,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "orphan",
+                "mallory",
+                "2026-01-06T00:00:00Z",
+                Some(999),
+            ),
             // Reply-to-a-reply lands in the root's thread.
-            rc(7, "a.rs", Some("RIGHT"), Some(2), "nested", "alice", "2026-01-07T00:00:00Z", Some(2)),
-            rc(8, "b.rs", Some("RIGHT"), Some(9), "other file", "bob", "2026-01-08T00:00:00Z", None),
+            rc(
+                7,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "nested",
+                "alice",
+                "2026-01-07T00:00:00Z",
+                Some(2),
+            ),
+            rc(
+                8,
+                "b.rs",
+                Some("RIGHT"),
+                Some(9),
+                "other file",
+                "bob",
+                "2026-01-08T00:00:00Z",
+                None,
+            ),
         ]);
         let a = &index.threads["a.rs"];
         let right = &a[&(CommentSide::Right, 2)];
@@ -7482,18 +7759,59 @@ mod tests {
     /// one outdated comment.
     fn sample_comments() -> CommentIndex {
         group_comments(vec![
-            rc(1, "a.rs", Some("RIGHT"), Some(2), "on new1", "alice", "2026-01-01T00:00:00Z", None),
-            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
-            rc(3, "a.rs", Some("LEFT"), Some(2), "on old1", "carol", "2026-01-03T00:00:00Z", None),
-            rc(4, "a.rs", None, None, "outdated", "dave", "2026-01-04T00:00:00Z", None),
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "on new1",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                3,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "on old1",
+                "carol",
+                "2026-01-03T00:00:00Z",
+                None,
+            ),
+            rc(
+                4,
+                "a.rs",
+                None,
+                None,
+                "outdated",
+                "dave",
+                "2026-01-04T00:00:00Z",
+                None,
+            ),
         ])
     }
 
     #[test]
     fn unified_rows_insert_threads_beneath_their_anchor() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
         // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
@@ -7502,30 +7820,34 @@ mod tests {
             &[
                 "FileHeader",
                 "HunkHeader",
-                "Line",           // ctx 1/1
-                "Line",           // rem old1 (old 2)
-                "CommentHeader",  // carol on old1
+                "Line",          // ctx 1/1
+                "Line",          // rem old1 (old 2)
+                "CommentHeader", // carol on old1
                 "CommentBody",
                 "CommentActions",
-                "Line",           // rem old2
-                "Line",           // add new1 (new 2)
-                "CommentHeader",  // alice
+                "Line",          // rem old2
+                "Line",          // add new1 (new 2)
+                "CommentHeader", // alice
                 "CommentBody",
-                "CommentHeader",  // bob's reply
+                "CommentHeader", // bob's reply
             ]
         );
         assert_eq!(names[12], "CommentBody");
         assert_eq!(names[13], "CommentActions");
         // The LEFT thread is carol's; the reply flag follows position.
         match &rows[4] {
-            Row::CommentHeader { author, is_reply, .. } => {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
                 assert_eq!(author.as_ref(), "carol");
                 assert!(!is_reply);
             }
             other => panic!("expected comment header, got {}", row_name(other)),
         }
         match &rows[11] {
-            Row::CommentHeader { author, is_reply, .. } => {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
                 assert_eq!(author.as_ref(), "bob");
                 assert!(is_reply);
             }
@@ -7533,7 +7855,12 @@ mod tests {
         }
         // Actions row targets the thread root and carries the anchor.
         match &rows[13] {
-            Row::CommentActions { root_id, path, side, line } => {
+            Row::CommentActions {
+                root_id,
+                path,
+                side,
+                line,
+            } => {
                 assert_eq!(*root_id, 1);
                 assert_eq!(path.as_ref(), "a.rs");
                 assert_eq!((*side, *line), (CommentSide::Right, 2));
@@ -7542,7 +7869,9 @@ mod tests {
         }
         // File header carries the counts (3 anchored, 1 outdated).
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (3, 1));
             }
             other => panic!("expected file header, got {}", row_name(other)),
@@ -7555,22 +7884,27 @@ mod tests {
     #[test]
     fn split_rows_anchor_threads_by_cell() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
             &names[2..11],
             &[
-                "SplitLine",      // ctx
-                "SplitLine",      // old1 | new1
-                "CommentHeader",  // carol (LEFT)
+                "SplitLine",     // ctx
+                "SplitLine",     // old1 | new1
+                "CommentHeader", // carol (LEFT)
                 "CommentBody",
                 "CommentActions",
-                "CommentHeader",  // alice (RIGHT)
+                "CommentHeader", // alice (RIGHT)
                 "CommentBody",
-                "CommentHeader",  // bob reply
+                "CommentHeader", // bob reply
                 "CommentBody",
             ]
         );
@@ -7581,21 +7915,35 @@ mod tests {
     #[test]
     fn hidden_comments_keep_header_counts() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), false);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            false,
+        );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (3, 1));
             }
             other => panic!("expected file header, got {}", row_name(other)),
         }
         // And with no index at all (local items): zero counts, no rows.
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (0, 0));
             }
             other => panic!("expected file header, got {}", row_name(other)),
@@ -7607,16 +7955,20 @@ mod tests {
         let (diff, mut upgrades) = upgraded_diff();
         // a.txt line 3 lives in the leading gap (hunk covers 7..=13).
         let index = group_comments(vec![rc(
-            9, "a.txt", Some("RIGHT"), Some(3), "gap comment", "alice",
-            "2026-01-01T00:00:00Z", None,
+            9,
+            "a.txt",
+            Some("RIGHT"),
+            Some(3),
+            "gap comment",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
         )]);
-        let (rows, _, _) =
-            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
         // Collapsed gap: the thread has no anchor row and stays hidden.
         assert!(!rows.iter().any(is_comment_row));
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
-        let (rows, _, _) =
-            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
         // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
         assert_eq!(row_name(&rows[3]), "Line");
         assert_eq!(row_name(&rows[4]), "CommentHeader");
@@ -7627,8 +7979,13 @@ mod tests {
     #[test]
     fn comment_anchor_resolves_sides_and_skips_non_lines() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
         assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
@@ -7668,10 +8025,20 @@ mod tests {
     #[test]
     fn nth_noncomment_row_maps_positions_across_comment_insertions() {
         let index = sample_comments();
-        let (plain, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
-        let (with, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (plain, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
+        let (with, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {
             let ix = nth_noncomment_row(&with, n);
@@ -7720,7 +8087,9 @@ mod tests {
         let meta = gh::PrMeta {
             number: 7,
             title: "Fix the frobnicator".into(),
-            author: gh::Author { login: "alice".into() },
+            author: gh::Author {
+                login: "alice".into(),
+            },
             state: "OPEN".into(),
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
@@ -7741,7 +8110,10 @@ mod tests {
         assert!(header.contains("main ← fix"));
         assert!(header.contains("It was broken."));
         // Empty body → explicit placeholder, so the model doesn't guess.
-        let meta = gh::PrMeta { body: "  \n".into(), ..meta };
+        let meta = gh::PrMeta {
+            body: "  \n".into(),
+            ..meta
+        };
         assert!(pr_chat_header(&meta).contains("(no description)"));
 
         let src = git::LocalSource {
@@ -7759,8 +8131,13 @@ mod tests {
 
     #[test]
     fn selection_info_resolves_anchor_and_text() {
-        let (rows, file_rows, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, file_rows, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
         // rem(3 "old2"), add(2 "new1"), …
         let unified = sel(SelSide::Unified, (2, 0), (5, 4));
@@ -7784,7 +8161,10 @@ mod tests {
 
         // A selection with no text (headers only) yields nothing.
         let empty = sel(SelSide::Unified, (0, 0), (0, 5));
-        assert_eq!(selection_info(&empty, &rows, &file_rows, &sample_diff()), None);
+        assert_eq!(
+            selection_info(&empty, &rows, &file_rows, &sample_diff()),
+            None
+        );
     }
 
     #[test]
