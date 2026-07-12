@@ -1,6 +1,7 @@
+mod lsp_client;
 mod theme;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail, Context as _};
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
@@ -23,10 +24,14 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
+
+use lsp_client::{DefinitionTarget, HoverResult, LspClient, LspPosition};
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -66,7 +71,12 @@ actions!(
         ToggleMinimap,
         ToggleComments,
         ToggleChat,
-        SubmitReview
+        SubmitReview,
+        GoToDefinition,
+        PeekDefinition,
+        NavBack,
+        NavForward,
+        ExpandPeek
     ]
 );
 
@@ -122,8 +132,13 @@ fn main() {
                 // palette's own escape routing wins by construction.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new("f12", GoToDefinition, Some("ReviewApp")),
+                KeyBinding::new("alt-f12", PeekDefinition, Some("ReviewApp")),
+                KeyBinding::new("enter", ExpandPeek, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
+                KeyBinding::new("cmd-left", NavBack, Some("ReviewApp")),
+                KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
@@ -2123,6 +2138,16 @@ struct ItemData {
     /// scrolls the tree when the viewport's file changes — never while the
     /// user scrolls the tree themselves.
     tree_last_file: Option<usize>,
+    lsp: Option<LspHandle>,
+    lsp_loading: bool,
+    lsp_error: Option<SharedString>,
+    hover: Option<HoverState>,
+    hover_gen: u64,
+    last_symbol_target: Option<SymbolTarget>,
+    peek: Option<PeekState>,
+    source_view: Option<SourceViewState>,
+    nav_back: Vec<NavLocation>,
+    nav_forward: Vec<NavLocation>,
 }
 
 impl ItemData {
@@ -2205,6 +2230,8 @@ struct ReviewItem {
     /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
     /// only lands if the generation it captured is still current.
     upgrade_gen: u64,
+    /// Bumped whenever LSP root/session startup is restarted.
+    lsp_gen: u64,
 }
 
 impl ReviewItem {
@@ -2328,6 +2355,16 @@ impl ReviewItem {
                     collapsed: HashSet::new(),
                     tree_scroll: UniformListScrollHandle::new(),
                     tree_last_file: None,
+                    lsp: None,
+                    lsp_loading: false,
+                    lsp_error: None,
+                    hover: None,
+                    hover_gen: 0,
+                    last_symbol_target: None,
+                    peek: None,
+                    source_view: None,
+                    nav_back: Vec::new(),
+                    nav_forward: Vec::new(),
                 });
                 data.rebuild_tree();
                 self.state = ItemState::Ready(data);
@@ -3230,6 +3267,100 @@ fn materialize_files(root: &Path, files: &[(String, String)]) -> Option<std::pat
     Some(root.to_path_buf())
 }
 
+fn lsp_root_for_source(source: &Source, pr_meta: Option<&gh::PrMeta>) -> anyhow::Result<PathBuf> {
+    match source {
+        Source::Local(src) => Ok(src.repo_root.clone()),
+        Source::Pr(loc) => {
+            let meta = pr_meta.context("PR metadata missing; cannot materialize LSP worktree")?;
+            if meta.head_ref_oid.is_empty() {
+                bail!("PR head oid missing; cannot materialize LSP worktree");
+            }
+            materialize_pr_worktree(loc, &meta.head_ref_oid)
+        }
+    }
+}
+
+fn materialize_pr_worktree(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
+    let root = lsp_worktree_root(loc, head_oid)?;
+    let pull_ref = format!("refs/pull/{}/head", loc.number);
+    if root.join(".git").exists() {
+        git_ok(&root, &["fetch", "--depth", "1", "origin", &pull_ref]).ok();
+        git_ok(&root, &["checkout", "--detach", head_oid])?;
+        return Ok(root);
+    }
+    let parent = root
+        .parent()
+        .context("worktree root unexpectedly has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = root.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    git_ok(
+        parent,
+        &[
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            &format!("https://github.com/{}.git", loc.repo_slug()),
+            tmp.file_name()
+                .and_then(|name| name.to_str())
+                .context("temporary worktree path is not UTF-8")?,
+        ],
+    )?;
+    git_ok(&tmp, &["fetch", "--depth", "1", "origin", &pull_ref])?;
+    git_ok(&tmp, &["checkout", "--detach", head_oid])?;
+    std::fs::rename(&tmp, &root).or_else(|_| {
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::rename(&tmp, &root)
+    })?;
+    Ok(root)
+}
+
+fn lsp_worktree_root(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let key = format!(
+        "{}__{}__pr{}__{}",
+        sanitize_path_part(&loc.owner),
+        sanitize_path_part(&loc.repo),
+        loc.number,
+        &head_oid[..head_oid.len().min(12)]
+    );
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("lgtm")
+        .join("worktrees")
+        .join(key))
+}
+
+fn sanitize_path_part(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|err| anyhow!("failed to run git: {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// How the next chat run gets its exploration dir, decided at send time.
 enum ExplorePlan {
     /// No tools: patch-only context.
@@ -3243,6 +3374,59 @@ enum ExplorePlan {
         root: std::path::PathBuf,
         files: Vec<(String, String)>,
     },
+}
+
+#[derive(Clone)]
+struct LspHandle {
+    root: PathBuf,
+    client: Arc<Mutex<LspClient>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SymbolTarget {
+    position: LspPosition,
+    row: usize,
+    col: usize,
+}
+
+#[derive(Clone)]
+struct HoverState {
+    target: SymbolTarget,
+    result: Option<HoverResult>,
+    loading: bool,
+    error: Option<SharedString>,
+    mouse: Point<Pixels>,
+    gen: u64,
+}
+
+#[derive(Clone)]
+struct PeekState {
+    target: DefinitionTarget,
+    lines: Vec<SharedString>,
+    error: Option<SharedString>,
+}
+
+#[derive(Clone)]
+struct SourceViewState {
+    target: DefinitionTarget,
+    lines: Vec<SharedString>,
+    scroll: UniformListScrollHandle,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum NavLocation {
+    Diff { row: usize },
+    Source { target: DefinitionTarget },
+}
+
+#[derive(Clone, Copy)]
+enum DefinitionMode {
+    Peek,
+    GoTo,
+}
+
+fn utf16_col_for_monospace_col(text: &str, col: usize) -> u32 {
+    text.chars().take(col).map(|ch| ch.len_utf16() as u32).sum()
 }
 
 struct ReviewApp {
@@ -3487,6 +3671,7 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            lsp_gen: 0,
         });
         self.active = self.items.len() - 1;
         Self::spawn_fetch(id, source, ViewMode::Split, cx);
@@ -3499,6 +3684,7 @@ impl ReviewApp {
                 .background_spawn(async move { fetch_item(&source, mode) })
                 .await;
             this.update(cx, |app, cx| {
+                let mut restart_lsp = false;
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
@@ -3506,6 +3692,7 @@ impl ReviewApp {
                 match fetched {
                     Ok(loaded) => {
                         item.install(loaded);
+                        restart_lsp = true;
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
                         // background. The bumped generation cancels any
@@ -3556,6 +3743,9 @@ impl ReviewApp {
                             _ => item.state = ItemState::Failed(msg),
                         }
                     }
+                }
+                if restart_lsp {
+                    app.restart_lsp_for_item(id, cx);
                 }
                 cx.notify();
             })
@@ -3627,6 +3817,63 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    fn restart_lsp_for_item(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        let ItemState::Ready(data) = &mut item.state else {
+            return;
+        };
+        item.lsp_gen += 1;
+        let gen = item.lsp_gen;
+        data.lsp = None;
+        data.lsp_error = None;
+        data.lsp_loading = true;
+        data.hover = None;
+        data.peek = None;
+        data.source_view = None;
+        let source = item.source.clone();
+        let pr_meta = data.pr_meta.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
+                    let client = LspClient::start(root.clone())?;
+                    Ok::<LspHandle, anyhow::Error>(LspHandle {
+                        root,
+                        client: Arc::new(Mutex::new(client)),
+                    })
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                    return;
+                };
+                if item.lsp_gen != gen {
+                    return;
+                }
+                let ItemState::Ready(data) = &mut item.state else {
+                    return;
+                };
+                data.lsp_loading = false;
+                match result {
+                    Ok(handle) => {
+                        data.lsp = Some(handle);
+                        data.lsp_error = None;
+                    }
+                    Err(err) => {
+                        data.lsp = None;
+                        data.lsp_error = Some(format!("{err:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Reveal all hidden lines of one gap in an upgraded file, keeping the
@@ -4319,6 +4566,313 @@ impl ReviewApp {
         let (side, hit) = self.pane_hit(position, char_width, None)?;
         let data = self.active_data()?;
         comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
+    }
+
+    fn symbol_target_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> Option<SymbolTarget> {
+        if self.palette.is_some() || self.composer.is_some() || self.review.is_some() {
+            return None;
+        }
+        let char_width = self.char_width(window);
+        let bounds = self.active_data()?.scroll.0.borrow().base_handle.bounds();
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let (side, hit) = self.pane_hit(position, char_width, None)?;
+        self.symbol_target_for_hit(side, hit)
+    }
+
+    fn symbol_target_for_hit(&self, side: SelSide, hit: RowCol) -> Option<SymbolTarget> {
+        let data = self.active_data()?;
+        let file_ix = data.file_rows.iter().rposition(|&row| row <= hit.row)?;
+        let file = data.diff.files.get(file_ix)?;
+        let path = file.new_path.as_ref()?.clone();
+        let (line, text) = match data.rows.get(hit.row)? {
+            Row::Line { new_no, text, .. } if side == SelSide::Unified => {
+                ((*new_no)? - 1, text.as_ref())
+            }
+            Row::SplitLine {
+                right: Some(cell), ..
+            } if side == SelSide::Right => (cell.no - 1, cell.text.as_ref()),
+            _ => return None,
+        };
+        let character = utf16_col_for_monospace_col(text, hit.col);
+        Some(SymbolTarget {
+            position: LspPosition {
+                path,
+                line,
+                character,
+            },
+            row: hit.row,
+            col: hit.col,
+        })
+    }
+
+    fn request_hover(
+        &mut self,
+        target: SymbolTarget,
+        mouse: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
+            return;
+        };
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        data.hover_gen += 1;
+        let gen = data.hover_gen;
+        data.last_symbol_target = Some(target.clone());
+        data.hover = Some(HoverState {
+            target: target.clone(),
+            result: None,
+            loading: true,
+            error: None,
+            mouse,
+            gen,
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let result = {
+                let mut client = handle.client.lock().unwrap();
+                client.hover(&target.position)
+            };
+            this.update(cx, |app, cx| {
+                let Some(data) = app.active_data_mut() else {
+                    return;
+                };
+                let Some(hover) = &mut data.hover else {
+                    return;
+                };
+                if hover.gen != gen || hover.target != target {
+                    return;
+                }
+                hover.loading = false;
+                match result {
+                    Ok(result) => {
+                        if let Some(result) = result {
+                            hover.result = Some(result);
+                        } else {
+                            data.hover = None;
+                        }
+                    }
+                    Err(err) => hover.error = Some(format!("{err:#}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn go_to_last_symbol(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .active_data()
+            .and_then(|data| data.last_symbol_target.clone())
+        else {
+            return;
+        };
+        self.request_definition(target, DefinitionMode::GoTo, cx);
+    }
+
+    fn peek_last_symbol(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .active_data()
+            .and_then(|data| data.last_symbol_target.clone())
+        else {
+            return;
+        };
+        self.request_definition(target, DefinitionMode::Peek, cx);
+    }
+
+    fn request_definition(
+        &mut self,
+        origin: SymbolTarget,
+        mode: DefinitionMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let result = {
+                let mut client = handle.client.lock().unwrap();
+                client.definition(&origin.position)
+            };
+            this.update(cx, |app, cx| {
+                let target = match result {
+                    Ok(mut targets) => targets.drain(..).next(),
+                    Err(err) => {
+                        if let Some(data) = app.active_data_mut() {
+                            data.peek = Some(PeekState {
+                                target: DefinitionTarget {
+                                    path: String::new(),
+                                    start_line: 0,
+                                    start_character: 0,
+                                    end_line: 0,
+                                    end_character: 0,
+                                },
+                                lines: Vec::new(),
+                                error: Some(format!("{err:#}").into()),
+                            });
+                        }
+                        cx.notify();
+                        return;
+                    }
+                };
+                let Some(target) = target else {
+                    return;
+                };
+                match mode {
+                    DefinitionMode::Peek => app.open_peek(target, cx),
+                    DefinitionMode::GoTo => app.open_source_target(target, true, cx),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_peek(&mut self, target: DefinitionTarget, cx: &mut Context<Self>) {
+        let lines = self
+            .read_lsp_source_lines(&target)
+            .unwrap_or_else(|err| vec![SharedString::from(format!("{err:#}"))]);
+        if let Some(data) = self.active_data_mut() {
+            data.peek = Some(PeekState {
+                target,
+                lines,
+                error: None,
+            });
+            cx.notify();
+        }
+    }
+
+    fn expand_peek(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .active_data()
+            .and_then(|data| data.peek.as_ref().map(|p| p.target.clone()))
+        else {
+            return;
+        };
+        self.open_source_target(target, true, cx);
+    }
+
+    fn open_source_target(
+        &mut self,
+        target: DefinitionTarget,
+        push_history: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = match self.read_lsp_source_lines(&target) {
+            Ok(lines) => lines,
+            Err(err) => {
+                if let Some(data) = self.active_data_mut() {
+                    data.peek = Some(PeekState {
+                        target,
+                        lines: Vec::new(),
+                        error: Some(format!("{err:#}").into()),
+                    });
+                    cx.notify();
+                }
+                return;
+            }
+        };
+        let current = self.current_nav_location();
+        if let Some(data) = self.active_data_mut() {
+            if push_history {
+                if let Some(current) = current {
+                    data.nav_back.push(current);
+                    data.nav_forward.clear();
+                }
+            }
+            data.source_view = Some(SourceViewState {
+                target,
+                lines,
+                scroll: UniformListScrollHandle::new(),
+            });
+            data.peek = None;
+            data.hover = None;
+            cx.notify();
+        }
+    }
+
+    fn read_lsp_source_lines(
+        &self,
+        target: &DefinitionTarget,
+    ) -> anyhow::Result<Vec<SharedString>> {
+        let data = self.active_data().context("no active item")?;
+        let handle = data.lsp.as_ref().context("LSP is not ready")?;
+        let path = handle.root.join(&target.path);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(text
+            .lines()
+            .map(|line| SharedString::from(line.to_string()))
+            .collect())
+    }
+
+    fn current_nav_location(&self) -> Option<NavLocation> {
+        let data = self.active_data()?;
+        if let Some(source) = &data.source_view {
+            Some(NavLocation::Source {
+                target: source.target.clone(),
+            })
+        } else {
+            Some(NavLocation::Diff { row: data.cursor })
+        }
+    }
+
+    fn nav_back(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(true, cx);
+    }
+
+    fn nav_forward(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(false, cx);
+    }
+
+    fn navigate_history(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.current_nav_location() else {
+            return;
+        };
+        let next = {
+            let Some(data) = self.active_data_mut() else {
+                return;
+            };
+            let stack = if backward {
+                &mut data.nav_back
+            } else {
+                &mut data.nav_forward
+            };
+            let Some(next) = stack.pop() else {
+                return;
+            };
+            if backward {
+                data.nav_forward.push(current);
+            } else {
+                data.nav_back.push(current);
+            }
+            next
+        };
+        self.restore_nav_location(next, cx);
+    }
+
+    fn restore_nav_location(&mut self, location: NavLocation, cx: &mut Context<Self>) {
+        match location {
+            NavLocation::Diff { row } => {
+                if let Some(data) = self.active_data_mut() {
+                    data.source_view = None;
+                    data.peek = None;
+                }
+                self.jump(row, cx);
+            }
+            NavLocation::Source { target } => self.open_source_target(target, false, cx),
+        }
     }
 
     fn open_composer(
@@ -6152,6 +6706,170 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    fn render_hover(&self) -> Option<gpui::AnyElement> {
+        let hover = self.active_data()?.hover.as_ref()?;
+        let text = if hover.loading {
+            SharedString::from("loading…")
+        } else if let Some(err) = &hover.error {
+            err.clone()
+        } else {
+            SharedString::from(hover.result.as_ref()?.text.clone())
+        };
+        Some(
+            div()
+                .absolute()
+                .left(hover.mouse.x + px(14.))
+                .top(hover.mouse.y + px(18.))
+                .max_w(px(520.))
+                .max_h(px(260.))
+                .overflow_hidden()
+                .p_3()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme::surface0())
+                .bg(theme::mantle())
+                .shadow_lg()
+                .font_family(MONO)
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(theme::text())
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
+    fn render_peek(&self) -> Option<gpui::AnyElement> {
+        let data = self.active_data()?;
+        let peek = data.peek.as_ref()?;
+        let start = peek.target.start_line.saturating_sub(4) as usize;
+        let end = (peek.target.start_line as usize + 12).min(peek.lines.len());
+        let mut body = div().flex().flex_col().font_family(MONO).text_size(px(12.));
+        if let Some(err) = &peek.error {
+            body = body.child(div().p_3().text_color(theme::red()).child(err.clone()));
+        } else {
+            for ix in start..end {
+                let line_no = ix + 1;
+                let mut row = div().h(px(20.)).flex().items_center();
+                if ix as u32 == peek.target.start_line {
+                    row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
+                }
+                body = body.child(
+                    row.child(
+                        div()
+                            .w(px(54.))
+                            .flex_shrink_0()
+                            .pr_2()
+                            .text_color(theme::overlay0())
+                            .flex()
+                            .justify_end()
+                            .child(SharedString::from(line_no.to_string())),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_color(theme::text())
+                            .child(peek.lines[ix].clone()),
+                    ),
+                );
+            }
+        }
+        Some(
+            div()
+                .absolute()
+                .left(px(72.))
+                .right(px(112.))
+                .bottom(px(18.))
+                .max_h(px(300.))
+                .overflow_hidden()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme::surface0())
+                .bg(theme::mantle())
+                .shadow_lg()
+                .child(
+                    div()
+                        .h(px(28.))
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_b_1()
+                        .border_color(theme::surface0())
+                        .text_size(px(12.))
+                        .text_color(theme::subtext())
+                        .child(SharedString::from(format!(
+                            "{}:{}",
+                            peek.target.path,
+                            peek.target.start_line + 1
+                        ))),
+                )
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    fn render_source_view(&self, source: &SourceViewState) -> gpui::AnyElement {
+        let lines = source.lines.clone();
+        let target = source.target.clone();
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(MONO)
+            .text_size(px(TEXT_SIZE))
+            .line_height(px(ROW_HEIGHT))
+            .child(
+                div()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(theme::mantle())
+                    .border_b_1()
+                    .border_color(theme::surface0())
+                    .text_color(theme::subtext())
+                    .child(SharedString::from(format!(
+                        "{}:{}",
+                        target.path,
+                        target.start_line + 1
+                    ))),
+            )
+            .child(
+                uniform_list("source", lines.len(), move |range, _window, _cx| {
+                    range
+                        .map(|ix| {
+                            let mut row = div().h(px(ROW_HEIGHT)).flex().items_center();
+                            if ix as u32 == target.start_line {
+                                row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
+                            }
+                            row.child(
+                                div()
+                                    .w(px(64.))
+                                    .flex_shrink_0()
+                                    .pr_2()
+                                    .text_color(theme::overlay0())
+                                    .flex()
+                                    .justify_end()
+                                    .child(SharedString::from((ix + 1).to_string())),
+                            )
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_color(theme::text())
+                                    .child(lines[ix].clone()),
+                            )
+                            .into_any_element()
+                        })
+                        .collect()
+                })
+                .track_scroll(source.scroll.clone())
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .flex_1()
+                .min_h_0(),
+            )
+            .into_any_element()
+    }
+
     fn render_footer(&self) -> impl IntoElement {
         let hint = |keys: &[&str], label: &'static str| {
             let mut hint = div().flex().items_center().gap_1();
@@ -6211,6 +6929,9 @@ impl Render for ReviewApp {
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
+                ItemState::Ready(data) if data.source_view.is_some() => {
+                    self.render_source_view(data.source_view.as_ref().unwrap())
+                }
                 ItemState::Ready(data) => div()
                     .size_full()
                     .relative()
@@ -6229,6 +6950,20 @@ impl Render for ReviewApp {
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             if this.palette.is_some() {
                                 return;
+                            }
+                            if event.modifiers.alt {
+                                if let Some(target) = this.symbol_target_at(event.position, window)
+                                {
+                                    this.request_definition(target, DefinitionMode::Peek, cx);
+                                    return;
+                                }
+                            }
+                            if event.modifiers.secondary() {
+                                if let Some(target) = this.symbol_target_at(event.position, window)
+                                {
+                                    this.request_definition(target, DefinitionMode::GoTo, cx);
+                                    return;
+                                }
                             }
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
@@ -6326,6 +7061,8 @@ impl Render for ReviewApp {
                     // Hover "+" (add comment) overlay, absolutely positioned
                     // at the hovered row's y like the minimap viewport.
                     .children(self.render_plus(cx))
+                    .when_some(self.render_peek(), |pane, peek| pane.child(peek))
+                    .when_some(self.render_hover(), |pane, hover| pane.child(hover))
                     .into_any_element(),
             },
         };
@@ -6393,6 +7130,11 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
+            .on_action(cx.listener(|this, _: &PeekDefinition, _, cx| this.peek_last_symbol(cx)))
+            .on_action(cx.listener(|this, _: &ExpandPeek, _, cx| this.expand_peek(cx)))
+            .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
+            .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -6403,6 +7145,21 @@ impl Render for ReviewApp {
                 if this.hover_plus != hover {
                     this.hover_plus = hover;
                     cx.notify();
+                }
+                let symbol = this.symbol_target_at(event.position, window);
+                let existing = this
+                    .active_data()
+                    .and_then(|data| data.hover.as_ref().map(|hover| hover.target.clone()));
+                match (symbol, existing) {
+                    (Some(target), Some(existing)) if target == existing => {}
+                    (Some(target), _) => this.request_hover(target, event.position, cx),
+                    (None, Some(_)) => {
+                        if let Some(data) = this.active_data_mut() {
+                            data.hover = None;
+                            cx.notify();
+                        }
+                    }
+                    (None, None) => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
@@ -6419,6 +7176,16 @@ impl Render for ReviewApp {
                 // Next in line: a streaming chat run — escape stops it.
                 if this.cancel_chat(cx) {
                     return;
+                }
+                if let Some(data) = this.active_data_mut() {
+                    if data.peek.take().is_some() || data.hover.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    if data.source_view.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
                 }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
