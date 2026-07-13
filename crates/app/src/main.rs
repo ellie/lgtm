@@ -75,10 +75,8 @@ actions!(
         ToggleChat,
         SubmitReview,
         GoToDefinition,
-        PeekDefinition,
         NavBack,
-        NavForward,
-        ExpandPeek
+        NavForward
     ]
 );
 
@@ -144,8 +142,6 @@ fn main() {
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
                 KeyBinding::new("f12", GoToDefinition, Some("ReviewApp")),
-                KeyBinding::new("alt-f12", PeekDefinition, Some("ReviewApp")),
-                KeyBinding::new("enter", ExpandPeek, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
                 KeyBinding::new("cmd-left", NavBack, Some("ReviewApp")),
@@ -2159,7 +2155,6 @@ struct ItemData {
     hover_gen: u64,
     hover_cancel: Option<Arc<AtomicBool>>,
     last_symbol_target: Option<SymbolTarget>,
-    peek: Option<PeekState>,
     source_view: Option<SourceViewState>,
     nav_back: Vec<NavLocation>,
     nav_forward: Vec<NavLocation>,
@@ -2378,7 +2373,6 @@ impl ReviewItem {
                     hover_gen: 0,
                     hover_cancel: None,
                     last_symbol_target: None,
-                    peek: None,
                     source_view: None,
                     nav_back: Vec::new(),
                     nav_forward: Vec::new(),
@@ -3415,13 +3409,6 @@ struct HoverState {
 }
 
 #[derive(Clone)]
-struct PeekState {
-    target: DefinitionTarget,
-    lines: Vec<SharedString>,
-    error: Option<SharedString>,
-}
-
-#[derive(Clone)]
 struct SourceViewState {
     target: DefinitionTarget,
     lines: Vec<SharedString>,
@@ -3432,12 +3419,6 @@ struct SourceViewState {
 enum NavLocation {
     Diff { row: usize },
     Source { target: DefinitionTarget },
-}
-
-#[derive(Clone, Copy)]
-enum DefinitionMode {
-    Peek,
-    GoTo,
 }
 
 fn utf16_col_for_monospace_col(text: &str, col: usize) -> u32 {
@@ -3939,7 +3920,6 @@ impl ReviewApp {
             cancel.store(true, Ordering::Release);
         }
         data.hover = None;
-        data.peek = None;
         data.source_view = None;
         let source = item.source.clone();
         let pr_meta = data.pr_meta.clone();
@@ -4908,25 +4888,10 @@ impl ReviewApp {
         else {
             return;
         };
-        self.request_definition(target, DefinitionMode::GoTo, cx);
+        self.request_definition(target, cx);
     }
 
-    fn peek_last_symbol(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .active_data()
-            .and_then(|data| data.last_symbol_target.clone())
-        else {
-            return;
-        };
-        self.request_definition(target, DefinitionMode::Peek, cx);
-    }
-
-    fn request_definition(
-        &mut self,
-        origin: SymbolTarget,
-        mode: DefinitionMode,
-        cx: &mut Context<Self>,
-    ) {
+    fn request_definition(&mut self, origin: SymbolTarget, cx: &mut Context<Self>) {
         let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
             return;
         };
@@ -4942,58 +4907,18 @@ impl ReviewApp {
                 let target = match result {
                     Ok(mut targets) => targets.drain(..).next(),
                     Err(err) => {
-                        if let Some(data) = app.active_data_mut() {
-                            data.peek = Some(PeekState {
-                                target: DefinitionTarget {
-                                    path: String::new(),
-                                    start_line: 0,
-                                    start_character: 0,
-                                    end_line: 0,
-                                    end_character: 0,
-                                },
-                                lines: Vec::new(),
-                                error: Some(format!("{err:#}").into()),
-                            });
-                        }
-                        cx.notify();
+                        lsp_trace(format_args!("ui definition error: {err:#}"));
                         return;
                     }
                 };
                 let Some(target) = target else {
                     return;
                 };
-                match mode {
-                    DefinitionMode::Peek => app.open_peek(target, cx),
-                    DefinitionMode::GoTo => app.open_source_target(target, true, cx),
-                }
+                app.open_source_target(target, true, cx);
             })
             .ok();
         })
         .detach();
-    }
-
-    fn open_peek(&mut self, target: DefinitionTarget, cx: &mut Context<Self>) {
-        let lines = self
-            .read_lsp_source_lines(&target)
-            .unwrap_or_else(|err| vec![SharedString::from(format!("{err:#}"))]);
-        if let Some(data) = self.active_data_mut() {
-            data.peek = Some(PeekState {
-                target,
-                lines,
-                error: None,
-            });
-            cx.notify();
-        }
-    }
-
-    fn expand_peek(&mut self, cx: &mut Context<Self>) {
-        let Some(target) = self
-            .active_data()
-            .and_then(|data| data.peek.as_ref().map(|p| p.target.clone()))
-        else {
-            return;
-        };
-        self.open_source_target(target, true, cx);
     }
 
     fn open_source_target(
@@ -5005,14 +4930,7 @@ impl ReviewApp {
         let lines = match self.read_lsp_source_lines(&target) {
             Ok(lines) => lines,
             Err(err) => {
-                if let Some(data) = self.active_data_mut() {
-                    data.peek = Some(PeekState {
-                        target,
-                        lines: Vec::new(),
-                        error: Some(format!("{err:#}").into()),
-                    });
-                    cx.notify();
-                }
+                lsp_trace(format_args!("ui definition source error: {err:#}"));
                 return;
             }
         };
@@ -5036,7 +4954,6 @@ impl ReviewApp {
                 lines,
                 scroll,
             });
-            data.peek = None;
             data.hover = None;
             cx.notify();
         }
@@ -5107,7 +5024,6 @@ impl ReviewApp {
             NavLocation::Diff { row } => {
                 if let Some(data) = self.active_data_mut() {
                     data.source_view = None;
-                    data.peek = None;
                 }
                 self.jump(row, cx);
             }
@@ -7021,75 +6937,6 @@ impl ReviewApp {
         )
     }
 
-    fn render_peek(&self) -> Option<gpui::AnyElement> {
-        let data = self.active_data()?;
-        let peek = data.peek.as_ref()?;
-        let start = peek.target.start_line.saturating_sub(4) as usize;
-        let end = (peek.target.start_line as usize + 12).min(peek.lines.len());
-        let mut body = div().flex().flex_col().font_family(MONO).text_size(px(12.));
-        if let Some(err) = &peek.error {
-            body = body.child(div().p_3().text_color(theme::red()).child(err.clone()));
-        } else {
-            for ix in start..end {
-                let line_no = ix + 1;
-                let mut row = div().h(px(20.)).flex().items_center();
-                if ix as u32 == peek.target.start_line {
-                    row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
-                }
-                body = body.child(
-                    row.child(
-                        div()
-                            .w(px(54.))
-                            .flex_shrink_0()
-                            .pr_2()
-                            .text_color(theme::overlay0())
-                            .flex()
-                            .justify_end()
-                            .child(SharedString::from(line_no.to_string())),
-                    )
-                    .child(
-                        div()
-                            .whitespace_nowrap()
-                            .text_color(theme::text())
-                            .child(peek.lines[ix].clone()),
-                    ),
-                );
-            }
-        }
-        Some(
-            div()
-                .absolute()
-                .left(px(72.))
-                .right(px(112.))
-                .bottom(px(18.))
-                .max_h(px(300.))
-                .overflow_hidden()
-                .rounded_sm()
-                .border_1()
-                .border_color(theme::surface0())
-                .bg(theme::mantle())
-                .shadow_lg()
-                .child(
-                    div()
-                        .h(px(28.))
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .border_b_1()
-                        .border_color(theme::surface0())
-                        .text_size(px(12.))
-                        .text_color(theme::subtext())
-                        .child(SharedString::from(format!(
-                            "{}:{}",
-                            peek.target.path,
-                            peek.target.start_line + 1
-                        ))),
-                )
-                .child(body)
-                .into_any_element(),
-        )
-    }
-
     fn render_source_view(
         &self,
         source: &SourceViewState,
@@ -7263,17 +7110,10 @@ impl Render for ReviewApp {
                             if this.palette.is_some() {
                                 return;
                             }
-                            if event.modifiers.alt {
-                                if let Some(target) = this.symbol_target_at(event.position, window)
-                                {
-                                    this.request_definition(target, DefinitionMode::Peek, cx);
-                                    return;
-                                }
-                            }
                             if event.modifiers.secondary() {
                                 if let Some(target) = this.symbol_target_at(event.position, window)
                                 {
-                                    this.request_definition(target, DefinitionMode::GoTo, cx);
+                                    this.request_definition(target, cx);
                                     return;
                                 }
                             }
@@ -7373,7 +7213,6 @@ impl Render for ReviewApp {
                     // Hover "+" (add comment) overlay, absolutely positioned
                     // at the hovered row's y like the minimap viewport.
                     .children(self.render_plus(cx))
-                    .when_some(self.render_peek(), |pane, peek| pane.child(peek))
                     .when_some(self.render_hover(), |pane, hover| pane.child(hover))
                     .into_any_element(),
             },
@@ -7443,8 +7282,6 @@ impl Render for ReviewApp {
             }))
             .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
             .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
-            .on_action(cx.listener(|this, _: &PeekDefinition, _, cx| this.peek_last_symbol(cx)))
-            .on_action(cx.listener(|this, _: &ExpandPeek, _, cx| this.expand_peek(cx)))
             .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
             .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
             // Hover tracking for the "+" affordance lives on the root so the
@@ -7496,7 +7333,7 @@ impl Render for ReviewApp {
                     return;
                 }
                 if let Some(data) = this.active_data_mut() {
-                    if data.peek.take().is_some() || data.hover.take().is_some() {
+                    if data.hover.take().is_some() {
                         cx.notify();
                         return;
                     }
