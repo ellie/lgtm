@@ -6904,6 +6904,11 @@ impl ReviewApp {
     fn render_hover(&self) -> Option<gpui::AnyElement> {
         let data = self.active_data()?;
         let hover = data.hover.as_ref()?;
+        let definition_hint = if cfg!(target_os = "macos") {
+            "Cmd+click to go to definition"
+        } else {
+            "Ctrl+click to go to definition"
+        };
         let text = if hover.loading {
             let percentage = data
                 .lsp_progress
@@ -6922,17 +6927,28 @@ impl ReviewApp {
                 .max_w(px(520.))
                 .max_h(px(260.))
                 .overflow_hidden()
-                .p_3()
                 .rounded_sm()
                 .border_1()
                 .border_color(theme::surface0())
                 .bg(theme::mantle())
                 .shadow_lg()
+                .flex()
+                .flex_col()
                 .font_family(MONO)
                 .text_size(px(12.))
                 .line_height(px(18.))
                 .text_color(theme::text())
-                .child(text)
+                .child(div().p_3().child(text))
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::surface0())
+                        .px_3()
+                        .py_1()
+                        .text_size(px(10.))
+                        .text_color(theme::overlay0())
+                        .child(definition_hint),
+                )
                 .into_any_element(),
         )
     }
