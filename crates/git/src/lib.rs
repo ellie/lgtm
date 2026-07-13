@@ -1,6 +1,6 @@
 //! Local git diffs via the `git` CLI: "the PR I'd open from here" — everything
-//! since the merge-base with the default remote head (committed + staged +
-//! unstaged + untracked), as one unified patch for diff-core to parse.
+//! since the merge-base with the default branch (committed + staged + unstaged
+//! + untracked), as one unified patch for diff-core to parse.
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,12 +13,11 @@ const MAX_UNTRACKED_FILES: usize = 200;
 pub struct LocalSource {
     pub repo_root: PathBuf,
     pub branch: String,
-    /// Human name of the diff base: "origin/main"-style remote head when one
-    /// exists and shares history with HEAD, otherwise "HEAD" (working-tree-only
-    /// diff).
+    /// Human name of the diff base: "origin/main"-style ref when one exists
+    /// and shares history with HEAD, otherwise "HEAD" (working-tree-only diff).
     pub base_label: String,
     /// Commit oid of the diff base, captured at resolve time: the merge-base
-    /// with the remote head, or HEAD itself. None only in a repo with no
+    /// with the selected base ref, or HEAD itself. None only in a repo with no
     /// commits yet (old side of every file is then absent).
     pub base_oid: Option<String>,
 }
@@ -34,20 +33,24 @@ pub fn resolve_local(path: &Path) -> Result<LocalSource> {
         .trim()
         .to_string();
 
-    // Default remote head: prefer the recorded origin/HEAD symref, then the
-    // conventional names. A candidate only counts if it shares a merge-base
-    // with HEAD; otherwise fall back to a working-tree-only diff against HEAD.
+    // Default branch: prefer recorded remote HEAD symrefs, then conventional
+    // fork/upstream names, then local main/master. A candidate only counts if
+    // it shares a merge-base with HEAD; otherwise fall back to HEAD.
     let mut candidates = Vec::new();
-    if let Ok(symref) = git(&repo_root, &["symbolic-ref", "refs/remotes/origin/HEAD"]) {
-        if let Some(name) = symref.trim().strip_prefix("refs/remotes/") {
-            candidates.push(name.to_string());
-        }
-    }
+    push_remote_head(&repo_root, "origin", &mut candidates);
+    push_remote_head(&repo_root, "upstream", &mut candidates);
     candidates.push("origin/main".to_string());
+    candidates.push("upstream/main".to_string());
     candidates.push("origin/master".to_string());
+    candidates.push("upstream/master".to_string());
+    candidates.push("main".to_string());
+    candidates.push("master".to_string());
     let mut base_oid = None;
     let mut base_label = "HEAD".to_string();
     for cand in candidates {
+        if cand == branch {
+            continue;
+        }
         if let Ok(oid) = git(&repo_root, &["merge-base", "HEAD", &cand]) {
             base_oid = Some(oid.trim().to_string());
             base_label = cand;
@@ -67,6 +70,17 @@ pub fn resolve_local(path: &Path) -> Result<LocalSource> {
         base_label,
         base_oid,
     })
+}
+
+fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>) {
+    if let Ok(symref) = git(
+        repo_root,
+        &["symbolic-ref", &format!("refs/remotes/{remote}/HEAD")],
+    ) {
+        if let Some(name) = symref.trim().strip_prefix("refs/remotes/") {
+            candidates.push(name.to_string());
+        }
+    }
 }
 
 /// Full contents of `path` at the captured diff base, for the Phase-2 upgrade.
@@ -166,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn no_remote_diffs_working_tree_against_head() {
+    fn no_remote_main_branch_diffs_working_tree_against_head() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         init_repo(dir);
@@ -194,6 +208,29 @@ mod tests {
         assert!(by_path.contains(&("a.rs", FileStatus::Modified)), "{by_path:?}");
         assert!(by_path.contains(&("new.txt", FileStatus::Added)), "{by_path:?}");
         assert!(by_path.contains(&("blob.bin", FileStatus::Binary)), "{by_path:?}");
+    }
+
+    #[test]
+    fn no_remote_feature_branch_diffs_against_local_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\n").unwrap();
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "init"]);
+        run(dir, &["git", "checkout", "-b", "feature"]);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        run(dir, &["git", "commit", "-am", "add two"]);
+
+        let src = resolve_local(dir).unwrap();
+        assert_eq!(src.branch, "feature");
+        assert_eq!(src.base_label, "main");
+
+        let patch = diff_patch(&src).unwrap();
+        let diff = diff_core::parse_patch(&patch);
+        assert_eq!(diff.files.len(), 1);
+        assert_eq!(diff.files[0].display_path(), "lib.rs");
+        assert_eq!((diff.files[0].additions, diff.files[0].deletions), (1, 0));
     }
 
     #[test]
@@ -236,6 +273,38 @@ mod tests {
         assert_eq!(file.status, FileStatus::Modified);
         // Committed line + uncommitted line, both present.
         assert_eq!((file.additions, file.deletions), (2, 0));
+    }
+
+    #[test]
+    fn fork_branch_diffs_against_upstream_main_when_origin_main_is_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream = tmp.path().join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        init_repo(&upstream);
+        fs::write(upstream.join("lib.rs"), "pub fn one() {}\n").unwrap();
+        run(&upstream, &["git", "add", "."]);
+        run(&upstream, &["git", "commit", "-m", "init"]);
+
+        let fork = tmp.path().join("fork");
+        run(
+            tmp.path(),
+            &["git", "clone", upstream.to_str().unwrap(), fork.to_str().unwrap()],
+        );
+        run(&fork, &["git", "remote", "rename", "origin", "upstream"]);
+        let empty_origin = tmp.path().join("origin");
+        fs::create_dir(&empty_origin).unwrap();
+        init_repo(&empty_origin);
+        run(&fork, &["git", "remote", "add", "origin", empty_origin.to_str().unwrap()]);
+        run(&fork, &["git", "config", "user.email", "test@example.com"]);
+        run(&fork, &["git", "config", "user.name", "Test"]);
+        run(&fork, &["git", "config", "commit.gpgsign", "false"]);
+        run(&fork, &["git", "checkout", "-b", "feature"]);
+        fs::write(fork.join("lib.rs"), "pub fn one() {}\npub fn two() {}\n").unwrap();
+        run(&fork, &["git", "commit", "-am", "add two"]);
+
+        let src = resolve_local(&fork).unwrap();
+        assert_eq!(src.branch, "feature");
+        assert_eq!(src.base_label, "upstream/main");
     }
 
     #[test]
