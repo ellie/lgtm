@@ -13,6 +13,9 @@ const MAX_UNTRACKED_FILES: usize = 200;
 pub struct LocalSource {
     pub repo_root: PathBuf,
     pub branch: String,
+    /// A user-selected base ref. None means use the repository default
+    /// heuristic on refresh.
+    pub base_ref: Option<String>,
     /// Human name of the diff base: "origin/main"-style ref when one exists
     /// and shares history with HEAD, otherwise "HEAD" (working-tree-only diff).
     pub base_label: String,
@@ -24,6 +27,11 @@ pub struct LocalSource {
 
 /// Resolve a path inside a git repo to its root, current branch, and diff base.
 pub fn resolve_local(path: &Path) -> Result<LocalSource> {
+    resolve_local_with_base(path, None)
+}
+
+/// Resolve a path inside a git repo using a specific base ref when provided.
+pub fn resolve_local_with_base(path: &Path, base_ref: Option<&str>) -> Result<LocalSource> {
     let repo_root = PathBuf::from(
         git(path, &["rev-parse", "--show-toplevel"])
             .with_context(|| format!("{} is not inside a git repository", path.display()))?
@@ -33,21 +41,36 @@ pub fn resolve_local(path: &Path) -> Result<LocalSource> {
         .trim()
         .to_string();
 
+    if let Some(base_ref) = base_ref {
+        let base_ref = base_ref.trim();
+        if base_ref == "HEAD" {
+            return Ok(LocalSource {
+                repo_root,
+                branch,
+                base_ref: Some(base_ref.to_string()),
+                base_label: "HEAD".to_string(),
+                base_oid: git(path, &["rev-parse", "HEAD"])
+                    .ok()
+                    .map(|oid| oid.trim().to_string()),
+            });
+        }
+        let oid = git(&repo_root, &["merge-base", "HEAD", base_ref])
+            .with_context(|| format!("{base_ref} does not share history with HEAD"))?;
+        return Ok(LocalSource {
+            repo_root,
+            branch,
+            base_ref: Some(base_ref.to_string()),
+            base_label: base_ref.to_string(),
+            base_oid: Some(oid.trim().to_string()),
+        });
+    }
+
     // Default branch: prefer recorded remote HEAD symrefs, then conventional
     // fork/upstream names, then local main/master. A candidate only counts if
     // it shares a merge-base with HEAD; otherwise fall back to HEAD.
-    let mut candidates = Vec::new();
-    push_remote_head(&repo_root, "origin", &mut candidates);
-    push_remote_head(&repo_root, "upstream", &mut candidates);
-    candidates.push("origin/main".to_string());
-    candidates.push("upstream/main".to_string());
-    candidates.push("origin/master".to_string());
-    candidates.push("upstream/master".to_string());
-    candidates.push("main".to_string());
-    candidates.push("master".to_string());
     let mut base_oid = None;
     let mut base_label = "HEAD".to_string();
-    for cand in candidates {
+    for cand in default_base_candidates(&repo_root) {
         if cand == branch {
             continue;
         }
@@ -67,9 +90,65 @@ pub fn resolve_local(path: &Path) -> Result<LocalSource> {
     Ok(LocalSource {
         repo_root,
         branch,
+        base_ref: None,
         base_label,
         base_oid,
     })
+}
+
+/// Refs suitable for choosing a local diff base, in UI order.
+pub fn list_base_refs(path: &Path) -> Result<Vec<String>> {
+    let repo_root = PathBuf::from(
+        git(path, &["rev-parse", "--show-toplevel"])
+            .with_context(|| format!("{} is not inside a git repository", path.display()))?
+            .trim(),
+    );
+    let branch = git(&repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+    let mut candidates = Vec::new();
+    for cand in default_base_candidates(&repo_root) {
+        push_unique(&mut candidates, cand);
+    }
+    push_unique(&mut candidates, "HEAD".to_string());
+    let refs = git(
+        &repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    for cand in refs.lines().map(str::trim).filter(|cand| !cand.is_empty()) {
+        if cand == branch || cand.ends_with("/HEAD") {
+            continue;
+        }
+        push_unique(&mut candidates, cand.to_string());
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|cand| cand == "HEAD" || git(&repo_root, &["merge-base", "HEAD", cand]).is_ok())
+        .collect())
+}
+
+fn default_base_candidates(repo_root: &Path) -> Vec<String> {
+    let mut candidates = Vec::new();
+    push_remote_head(repo_root, "origin", &mut candidates);
+    push_remote_head(repo_root, "upstream", &mut candidates);
+    push_unique(&mut candidates, "origin/main".to_string());
+    push_unique(&mut candidates, "upstream/main".to_string());
+    push_unique(&mut candidates, "origin/master".to_string());
+    push_unique(&mut candidates, "upstream/master".to_string());
+    push_unique(&mut candidates, "main".to_string());
+    push_unique(&mut candidates, "master".to_string());
+    candidates
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
 }
 
 fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>) {
@@ -78,7 +157,7 @@ fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>
         &["symbolic-ref", &format!("refs/remotes/{remote}/HEAD")],
     ) {
         if let Some(name) = symref.trim().strip_prefix("refs/remotes/") {
-            candidates.push(name.to_string());
+            push_unique(candidates, name.to_string());
         }
     }
 }
@@ -231,6 +310,54 @@ mod tests {
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].display_path(), "lib.rs");
         assert_eq!((diff.files[0].additions, diff.files[0].deletions), (1, 0));
+    }
+
+    #[test]
+    fn explicit_base_ref_overrides_default_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\n").unwrap();
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "init"]);
+        run(dir, &["git", "checkout", "-b", "release"]);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\npub fn release() {}\n").unwrap();
+        run(dir, &["git", "commit", "-am", "release"]);
+        run(dir, &["git", "checkout", "main"]);
+        run(dir, &["git", "checkout", "-b", "feature"]);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\npub fn feature() {}\n").unwrap();
+        run(dir, &["git", "commit", "-am", "feature"]);
+
+        let auto = resolve_local(dir).unwrap();
+        assert_eq!(auto.base_label, "main");
+        assert_eq!(auto.base_ref, None);
+
+        let explicit = resolve_local_with_base(dir, Some("release")).unwrap();
+        assert_eq!(explicit.base_label, "release");
+        assert_eq!(explicit.base_ref.as_deref(), Some("release"));
+        assert_eq!(
+            explicit.base_oid.as_deref(),
+            Some(git(dir, &["merge-base", "HEAD", "release"]).unwrap().trim())
+        );
+    }
+
+    #[test]
+    fn list_base_refs_includes_head_and_local_branches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        init_repo(dir);
+        fs::write(dir.join("lib.rs"), "pub fn one() {}\n").unwrap();
+        run(dir, &["git", "add", "."]);
+        run(dir, &["git", "commit", "-m", "init"]);
+        run(dir, &["git", "checkout", "-b", "release"]);
+        run(dir, &["git", "checkout", "main"]);
+        run(dir, &["git", "checkout", "-b", "feature"]);
+
+        let refs = list_base_refs(dir).unwrap();
+        assert!(refs.iter().any(|base| base == "HEAD"), "{refs:?}");
+        assert!(refs.iter().any(|base| base == "main"), "{refs:?}");
+        assert!(refs.iter().any(|base| base == "release"), "{refs:?}");
+        assert!(!refs.iter().any(|base| base == "feature"), "{refs:?}");
     }
 
     #[test]
