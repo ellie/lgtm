@@ -3216,12 +3216,16 @@ fn chat_prompt(
     out
 }
 
-fn local_review_prompt(review: &LocalReview) -> String {
-    local_review_threads(review)
+fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
+    let threads = local_review_threads(review)
         .iter()
         .map(format_local_thread_prompt)
         .collect::<Vec<_>>()
-        .join("\n=====\n")
+        .join("\n=====\n");
+    format!(
+        "Diff: {} ← {}. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\n{}",
+        src.base_label, src.branch, threads
+    )
 }
 
 fn local_review_threads(review: &LocalReview) -> Vec<CommentThread> {
@@ -3255,8 +3259,10 @@ fn format_local_thread_prompt(thread: &CommentThread) -> String {
     } else {
         &thread.root.path
     };
-    let line = thread.root.line.unwrap_or(0);
-    let mut sections = vec![format!("{file}:L{line}"), thread.root.body.clone()];
+    let mut sections = vec![
+        local_comment_location(file, thread.root.side.as_deref(), thread.root.line),
+        thread.root.body.clone(),
+    ];
     for (ix, reply) in thread.replies.iter().enumerate() {
         let author = if reply.user.login.trim().is_empty() {
             "Unknown"
@@ -3267,6 +3273,14 @@ fn format_local_thread_prompt(thread: &CommentThread) -> String {
         sections.push(reply.body.clone());
     }
     sections.join("\n")
+}
+
+fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> String {
+    let line = line.unwrap_or(0);
+    match side {
+        Some("LEFT") => format!("{file}:L{line}"),
+        _ => format!("{file}:R{line}"),
+    }
 }
 
 /// What a selection pins down for the chat: the anchor triple (path, side,
@@ -5316,7 +5330,7 @@ impl ReviewApp {
         let Some(item) = self.active_item() else {
             return;
         };
-        let Source::Local(_) = &item.source else {
+        let Source::Local(src) = &item.source else {
             return;
         };
         let ItemState::Ready(data) = &item.state else {
@@ -5325,7 +5339,7 @@ impl ReviewApp {
         let Some(local) = &data.local_review else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(local)));
+        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(src, local)));
     }
 
     /// Refetch only the review comments (not meta/patch), regroup, and
@@ -9270,6 +9284,13 @@ mod tests {
 
     #[test]
     fn local_review_prompt_matches_difit_comment_format() {
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "upstream/main".into(),
+            base_oid: None,
+        };
         let mut review = LocalReview::default();
         review.add_comment(
             None,
@@ -9288,14 +9309,14 @@ mod tests {
         review.add_comment(
             None,
             "src/main.rs".to_string(),
-            CommentSide::Right,
+            CommentSide::Left,
             12,
             "second thread".to_string(),
         );
 
         assert_eq!(
-            local_review_prompt(&review),
-            "src/lib.rs:L7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
+            local_review_prompt(&src, &review),
+            "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
         );
     }
 
