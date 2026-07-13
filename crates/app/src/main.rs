@@ -9,8 +9,8 @@ use gpui::{
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, StyledText, Subscription, TitlebarOptions, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    SharedString, StyledText, Subscription, TextRun, TitlebarOptions, UniformListScrollHandle,
+    Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use lsp_client::{DefinitionTarget, HoverResult, LspClient, LspPosition};
+use lsp_client::{
+    trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession,
+};
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -82,6 +84,15 @@ actions!(
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [mode, root] = args.as_slice() {
+        if mode == "--bifrost-lsp-server" {
+            if let Err(err) = brokk_bifrost::lsp::run_lsp_stdio_server(PathBuf::from(root)) {
+                eprintln!("lgtm: embedded Bifrost LSP failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     let mut sources = Vec::new();
     let mut errors = Vec::new();
     if args.is_empty() {
@@ -139,6 +150,8 @@ fn main() {
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
                 KeyBinding::new("cmd-left", NavBack, Some("ReviewApp")),
                 KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
+                KeyBinding::new("alt-left", NavBack, Some("ReviewApp")),
+                KeyBinding::new("alt-right", NavForward, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
@@ -2139,10 +2152,12 @@ struct ItemData {
     /// user scrolls the tree themselves.
     tree_last_file: Option<usize>,
     lsp: Option<LspHandle>,
+    lsp_progress: Option<Arc<Mutex<LspProgress>>>,
     lsp_loading: bool,
     lsp_error: Option<SharedString>,
     hover: Option<HoverState>,
     hover_gen: u64,
+    hover_cancel: Option<Arc<AtomicBool>>,
     last_symbol_target: Option<SymbolTarget>,
     peek: Option<PeekState>,
     source_view: Option<SourceViewState>,
@@ -2356,10 +2371,12 @@ impl ReviewItem {
                     tree_scroll: UniformListScrollHandle::new(),
                     tree_last_file: None,
                     lsp: None,
+                    lsp_progress: None,
                     lsp_loading: false,
                     lsp_error: None,
                     hover: None,
                     hover_gen: 0,
+                    hover_cancel: None,
                     last_symbol_target: None,
                     peek: None,
                     source_view: None,
@@ -3379,7 +3396,8 @@ enum ExplorePlan {
 #[derive(Clone)]
 struct LspHandle {
     root: PathBuf,
-    client: Arc<Mutex<LspClient>>,
+    session: LspSession,
+    progress: Arc<Mutex<LspProgress>>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -3391,12 +3409,9 @@ struct SymbolTarget {
 
 #[derive(Clone)]
 struct HoverState {
-    target: SymbolTarget,
     result: Option<HoverResult>,
     loading: bool,
-    error: Option<SharedString>,
     mouse: Point<Pixels>,
-    gen: u64,
 }
 
 #[derive(Clone)]
@@ -3428,6 +3443,79 @@ enum DefinitionMode {
 fn utf16_col_for_monospace_col(text: &str, col: usize) -> u32 {
     text.chars().take(col).map(|ch| ch.len_utf16() as u32).sum()
 }
+
+fn identifier_start_at(text: &str, col: usize) -> Option<usize> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let is_identifier = |ch: char| ch == '_' || ch.is_alphanumeric();
+    let mut cursor = col.min(chars.len());
+    if chars.get(cursor).is_none_or(|ch| !is_identifier(*ch)) {
+        if chars.get(cursor).is_none_or(|ch| ch.is_whitespace()) {
+            return None;
+        }
+        cursor = cursor.checked_sub(1)?;
+        if !is_identifier(chars[cursor]) {
+            return None;
+        }
+    }
+    while cursor > 0 && is_identifier(chars[cursor - 1]) {
+        cursor -= 1;
+    }
+    Some(cursor)
+}
+
+fn lsp_warmup_position(data: &ItemData) -> Option<LspPosition> {
+    for (row_ix, row) in data.rows.iter().enumerate() {
+        let (line, text) = match row {
+            Row::Line { new_no, text, .. } => ((*new_no)? - 1, text.as_ref()),
+            Row::SplitLine {
+                right: Some(cell), ..
+            } => (cell.no - 1, cell.text.as_ref()),
+            _ => continue,
+        };
+        let file_ix = data.file_rows.iter().rposition(|&row| row <= row_ix)?;
+        let path = data.diff.files.get(file_ix)?.new_path.as_ref()?.clone();
+        let col = first_lsp_identifier_col(text)?;
+        return Some(LspPosition {
+            path,
+            line,
+            character: col,
+        });
+    }
+    None
+}
+
+fn first_lsp_identifier_col(text: &str) -> Option<u32> {
+    let mut chars = text.char_indices().peekable();
+    while let Some((start_byte, ch)) = chars.next() {
+        if !(ch == '_' || ch.is_ascii_alphabetic()) {
+            continue;
+        }
+        let mut end_byte = start_byte + ch.len_utf8();
+        while let Some(&(next_byte, next)) = chars.peek() {
+            if next == '_' || next.is_ascii_alphanumeric() {
+                end_byte = next_byte + next.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let ident = &text[start_byte..end_byte];
+        if !RUST_LSP_WARMUP_KEYWORDS.contains(&ident) {
+            return Some(utf16_col_for_monospace_col(
+                text,
+                text[..start_byte].chars().count(),
+            ));
+        }
+    }
+    None
+}
+
+const RUST_LSP_WARMUP_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
 
 struct ReviewApp {
     items: Vec<ReviewItem>,
@@ -3624,6 +3712,16 @@ impl ReviewApp {
         char_width: Pixels,
         locked: Option<SelSide>,
     ) -> Option<(SelSide, RowCol)> {
+        let (side, row, text_x) = self.pane_text_hit(position, locked)?;
+        let col = (f32::from(text_x) / f32::from(char_width)).round().max(0.) as usize;
+        Some((side, RowCol { row, col }))
+    }
+
+    fn pane_text_hit(
+        &self,
+        position: Point<Pixels>,
+        locked: Option<SelSide>,
+    ) -> Option<(SelSide, usize, Pixels)> {
         let data = self.active_data()?;
         if data.rows.is_empty() {
             return None;
@@ -3657,8 +3755,7 @@ impl ReviewApp {
                 (side, cell_x - SPLIT_GUTTER)
             }
         };
-        let col = (text_x / f32::from(char_width)).round().max(0.) as usize;
-        Some((side, RowCol { row, col }))
+        Some((side, row, px(text_x)))
     }
 
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
@@ -3831,19 +3928,33 @@ impl ReviewApp {
         data.lsp = None;
         data.lsp_error = None;
         data.lsp_loading = true;
+        let progress = Arc::new(Mutex::new(LspProgress {
+            title: Some("Indexing workspace".to_string()),
+            message: Some("Starting Bifrost".to_string()),
+            percentage: Some(0),
+            done: false,
+        }));
+        data.lsp_progress = Some(Arc::clone(&progress));
+        if let Some(cancel) = data.hover_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
         data.hover = None;
         data.peek = None;
         data.source_view = None;
         let source = item.source.clone();
         let pr_meta = data.pr_meta.clone();
+        let warmup = lsp_warmup_position(data);
+        let progress_for_start = Arc::clone(&progress);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_spawn(async move {
                     let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
-                    let client = LspClient::start(root.clone())?;
+                    let session =
+                        LspSession::start(root.clone(), Arc::clone(&progress_for_start), warmup)?;
                     Ok::<LspHandle, anyhow::Error>(LspHandle {
                         root,
-                        client: Arc::new(Mutex::new(client)),
+                        session,
+                        progress: progress_for_start,
                     })
                 })
                 .await;
@@ -3860,6 +3971,7 @@ impl ReviewApp {
                 data.lsp_loading = false;
                 match result {
                     Ok(handle) => {
+                        data.lsp_progress = Some(Arc::clone(&handle.progress));
                         data.lsp = Some(handle);
                         data.lsp_error = None;
                     }
@@ -3871,6 +3983,33 @@ impl ReviewApp {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let keep_going = this
+                .update(cx, |app, cx| {
+                    let Some(item) = app.items.iter().find(|item| item.id == id) else {
+                        return false;
+                    };
+                    if item.lsp_gen != gen {
+                        return false;
+                    }
+                    let ItemState::Ready(data) = &item.state else {
+                        return false;
+                    };
+                    if !data.lsp_loading {
+                        return false;
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
         })
         .detach();
         cx.notify();
@@ -4576,13 +4715,37 @@ impl ReviewApp {
         if self.palette.is_some() || self.composer.is_some() || self.review.is_some() {
             return None;
         }
-        let char_width = self.char_width(window);
         let bounds = self.active_data()?.scroll.0.borrow().base_handle.bounds();
         if !bounds.contains(&position) {
             return None;
         }
-        let (side, hit) = self.pane_hit(position, char_width, None)?;
-        self.symbol_target_for_hit(side, hit)
+        let (side, row, text_x) = self.pane_text_hit(position, None)?;
+        let text = match self.active_data()?.rows.get(row)? {
+            Row::Line { text, .. } if side == SelSide::Unified => text.as_ref(),
+            Row::SplitLine {
+                left: Some(cell), ..
+            } if side == SelSide::Left => cell.text.as_ref(),
+            Row::SplitLine {
+                right: Some(cell), ..
+            } if side == SelSide::Right => cell.text.as_ref(),
+            _ => return None,
+        };
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text.to_string()),
+            px(TEXT_SIZE),
+            &[TextRun {
+                len: text.len(),
+                font: font(MONO),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        let byte_col = shaped.index_for_x(text_x.max(px(0.)))?;
+        let col = text.get(..byte_col)?.chars().count();
+        self.symbol_target_for_hit(side, RowCol { row, col })
     }
 
     fn symbol_target_for_hit(&self, side: SelSide, hit: RowCol) -> Option<SymbolTarget> {
@@ -4599,7 +4762,16 @@ impl ReviewApp {
             } if side == SelSide::Right => (cell.no - 1, cell.text.as_ref()),
             _ => return None,
         };
-        let character = utf16_col_for_monospace_col(text, hit.col);
+        let col = identifier_start_at(text, hit.col)?;
+        let identifier = text
+            .chars()
+            .skip(col)
+            .take_while(|ch| *ch == '_' || ch.is_alphanumeric())
+            .collect::<String>();
+        if path.ends_with(".rs") && RUST_LSP_WARMUP_KEYWORDS.contains(&identifier.as_str()) {
+            return None;
+        }
+        let character = utf16_col_for_monospace_col(text, col);
         Some(SymbolTarget {
             position: LspPosition {
                 path,
@@ -4607,7 +4779,7 @@ impl ReviewApp {
                 character,
             },
             row: hit.row,
-            col: hit.col,
+            col,
         })
     }
 
@@ -4617,52 +4789,110 @@ impl ReviewApp {
         mouse: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
-            return;
-        };
         let Some(data) = self.active_data_mut() else {
             return;
         };
         data.hover_gen += 1;
         let gen = data.hover_gen;
+        lsp_trace(format_args!(
+            "ui hover gen={gen} {}:{}:{} ready={}",
+            target.position.path,
+            target.position.line + 1,
+            target.position.character + 1,
+            data.lsp.is_some()
+        ));
+        if let Some(cancel) = data.hover_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        let canceled = Arc::new(AtomicBool::new(false));
+        data.hover_cancel = Some(Arc::clone(&canceled));
         data.last_symbol_target = Some(target.clone());
-        data.hover = Some(HoverState {
-            target: target.clone(),
-            result: None,
-            loading: true,
-            error: None,
-            mouse,
-            gen,
-        });
-        cx.notify();
+        let Some(handle) = data.lsp.clone() else {
+            if data.lsp_loading {
+                let waiting_target = target.clone();
+                data.hover = Some(HoverState {
+                    result: None,
+                    loading: true,
+                    mouse,
+                });
+                cx.notify();
+                cx.spawn(async move |this, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(150))
+                        .await;
+                    let keep_waiting = this
+                        .update(cx, |app, cx| {
+                            let Some(data) = app.active_data() else {
+                                return false;
+                            };
+                            if data.hover_gen != gen
+                                || data.last_symbol_target.as_ref() != Some(&waiting_target)
+                            {
+                                return false;
+                            }
+                            if data.lsp.is_some() {
+                                app.request_hover(waiting_target.clone(), mouse, cx);
+                                return false;
+                            }
+                            data.lsp_loading
+                        })
+                        .unwrap_or(false);
+                    if !keep_waiting {
+                        break;
+                    }
+                })
+                .detach();
+            }
+            return;
+        };
+        data.hover = None;
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(250))
                 .await;
-            let result = {
-                let mut client = handle.client.lock().unwrap();
-                client.hover(&target.position)
-            };
+            let should_request = this
+                .update(cx, |app, _cx| {
+                    let Some(data) = app.active_data() else {
+                        return false;
+                    };
+                    if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
+                        lsp_trace(format_args!("ui hover debounce canceled gen={gen}"));
+                        return false;
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !should_request {
+                return;
+            }
+            let position = target.position.clone();
+            let result = cx
+                .background_spawn(async move { handle.session.hover(position, canceled) })
+                .await;
             this.update(cx, |app, cx| {
                 let Some(data) = app.active_data_mut() else {
                     return;
                 };
-                let Some(hover) = &mut data.hover else {
-                    return;
-                };
-                if hover.gen != gen || hover.target != target {
+                if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
                     return;
                 }
-                hover.loading = false;
                 match result {
-                    Ok(result) => {
-                        if let Some(result) = result {
-                            hover.result = Some(result);
-                        } else {
-                            data.hover = None;
-                        }
+                    Ok(Some(result)) => {
+                        lsp_trace(format_args!("ui hover content gen={gen}"));
+                        data.hover = Some(HoverState {
+                            result: Some(result),
+                            loading: false,
+                            mouse,
+                        });
                     }
-                    Err(err) => hover.error = Some(format!("{err:#}").into()),
+                    Ok(None) => {
+                        lsp_trace(format_args!("ui hover none gen={gen}"));
+                        data.hover = None;
+                    }
+                    Err(err) => {
+                        lsp_trace(format_args!("ui hover error gen={gen}: {err:#}"));
+                        data.hover = None;
+                    }
                 }
                 cx.notify();
             })
@@ -4700,11 +4930,14 @@ impl ReviewApp {
         let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
             return;
         };
+        if let Some(data) = self.active_data_mut() {
+            data.cursor = origin.row.min(data.rows.len().saturating_sub(1));
+        }
         cx.spawn(async move |this, cx| {
-            let result = {
-                let mut client = handle.client.lock().unwrap();
-                client.definition(&origin.position)
-            };
+            let position = origin.position.clone();
+            let result = cx
+                .background_spawn(async move { handle.session.definition(position) })
+                .await;
             this.update(cx, |app, cx| {
                 let target = match result {
                     Ok(mut targets) => targets.drain(..).next(),
@@ -4784,6 +5017,13 @@ impl ReviewApp {
             }
         };
         let current = self.current_nav_location();
+        let scroll = UniformListScrollHandle::new();
+        if !lines.is_empty() {
+            scroll.scroll_to_item(
+                (target.start_line as usize).min(lines.len() - 1),
+                ScrollStrategy::Center,
+            );
+        }
         if let Some(data) = self.active_data_mut() {
             if push_history {
                 if let Some(current) = current {
@@ -4794,7 +5034,7 @@ impl ReviewApp {
             data.source_view = Some(SourceViewState {
                 target,
                 lines,
-                scroll: UniformListScrollHandle::new(),
+                scroll,
             });
             data.peek = None;
             data.hover = None;
@@ -6170,6 +6410,7 @@ impl ReviewApp {
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
+            .when_some(self.render_lsp_status(), |bar, status| bar.child(status))
             .when_some(note, |bar, note| {
                 bar.child(
                     div()
@@ -6706,12 +6947,54 @@ impl ReviewApp {
             .into_any_element()
     }
 
+    fn render_lsp_status(&self) -> Option<gpui::AnyElement> {
+        let data = self.active_data()?;
+        let (text, color) = if let Some(err) = &data.lsp_error {
+            (
+                SharedString::from(format!("LSP: error - {err}")),
+                theme::red(),
+            )
+        } else if data.lsp_progress.is_some() {
+            let progress = data
+                .lsp_progress
+                .as_ref()
+                .and_then(|progress| progress.lock().ok().map(|progress| progress.clone()))
+                .unwrap_or_default();
+            let percentage = progress.percentage.unwrap_or(0);
+            (
+                SharedString::from(format!("LSP: {percentage}%")),
+                theme::blue(),
+            )
+        } else if data.lsp_loading {
+            (SharedString::from("LSP: 0%"), theme::blue())
+        } else {
+            return None;
+        };
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(Hsla::from(color).opacity(0.45))
+                .bg(Hsla::from(color).opacity(0.1))
+                .text_size(px(11.))
+                .text_color(color)
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
     fn render_hover(&self) -> Option<gpui::AnyElement> {
-        let hover = self.active_data()?.hover.as_ref()?;
+        let data = self.active_data()?;
+        let hover = data.hover.as_ref()?;
         let text = if hover.loading {
-            SharedString::from("loading…")
-        } else if let Some(err) = &hover.error {
-            err.clone()
+            let percentage = data
+                .lsp_progress
+                .as_ref()
+                .and_then(|progress| progress.lock().ok()?.percentage)
+                .unwrap_or(0);
+            SharedString::from(format!("LSP: {percentage}%"))
         } else {
             SharedString::from(hover.result.as_ref()?.text.clone())
         };
@@ -6807,9 +7090,19 @@ impl ReviewApp {
         )
     }
 
-    fn render_source_view(&self, source: &SourceViewState) -> gpui::AnyElement {
+    fn render_source_view(
+        &self,
+        source: &SourceViewState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let lines = source.lines.clone();
         let target = source.target.clone();
+        let can_back = self
+            .active_data()
+            .is_some_and(|data| !data.nav_back.is_empty());
+        let can_forward = self
+            .active_data()
+            .is_some_and(|data| !data.nav_forward.is_empty());
         div()
             .size_full()
             .flex()
@@ -6828,11 +7121,30 @@ impl ReviewApp {
                     .border_b_1()
                     .border_color(theme::surface0())
                     .text_color(theme::subtext())
-                    .child(SharedString::from(format!(
+                    .gap_1()
+                    .child(
+                        Button::new("source-nav-back")
+                            .icon(IconName::ArrowLeft)
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_back)
+                            .tooltip_with_action("Back", &NavBack, Some("ReviewApp"))
+                            .on_click(cx.listener(|this, _, _, cx| this.nav_back(cx))),
+                    )
+                    .child(
+                        Button::new("source-nav-forward")
+                            .icon(IconName::ArrowRight)
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_forward)
+                            .tooltip_with_action("Forward", &NavForward, Some("ReviewApp"))
+                            .on_click(cx.listener(|this, _, _, cx| this.nav_forward(cx))),
+                    )
+                    .child(div().min_w_0().truncate().child(SharedString::from(format!(
                         "{}:{}",
                         target.path,
                         target.start_line + 1
-                    ))),
+                    )))),
             )
             .child(
                 uniform_list("source", lines.len(), move |range, _window, _cx| {
@@ -6930,7 +7242,7 @@ impl Render for ReviewApp {
                     )
                     .into_any_element(),
                 ItemState::Ready(data) if data.source_view.is_some() => {
-                    self.render_source_view(data.source_view.as_ref().unwrap())
+                    self.render_source_view(data.source_view.as_ref().unwrap(), cx)
                 }
                 ItemState::Ready(data) => div()
                     .size_full()
@@ -7149,12 +7461,18 @@ impl Render for ReviewApp {
                 let symbol = this.symbol_target_at(event.position, window);
                 let existing = this
                     .active_data()
-                    .and_then(|data| data.hover.as_ref().map(|hover| hover.target.clone()));
+                    .and_then(|data| data.last_symbol_target.clone());
                 match (symbol, existing) {
                     (Some(target), Some(existing)) if target == existing => {}
                     (Some(target), _) => this.request_hover(target, event.position, cx),
                     (None, Some(_)) => {
                         if let Some(data) = this.active_data_mut() {
+                            data.hover_gen += 1;
+                            lsp_trace(format_args!("ui hover cleared gen={}", data.hover_gen));
+                            if let Some(cancel) = data.hover_cancel.take() {
+                                cancel.store(true, Ordering::Release);
+                            }
+                            data.last_symbol_target = None;
                             data.hover = None;
                             cx.notify();
                         }
@@ -7281,6 +7599,18 @@ impl Render for ReviewApp {
 mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
+
+    #[test]
+    fn identifier_hover_hit_snaps_to_the_token_start() {
+        let text = "    if cfg.font.mono_family.is_empty() {";
+        assert_eq!(identifier_start_at(text, 7), Some(7));
+        assert_eq!(identifier_start_at(text, 9), Some(7));
+        assert_eq!(identifier_start_at(text, 10), Some(7));
+        assert_eq!(identifier_start_at(text, 11), Some(11));
+        assert_eq!(identifier_start_at(text, 14), Some(11));
+        assert_eq!(identifier_start_at(text, 15), Some(11));
+        assert_eq!(identifier_start_at(text, 6), None);
+    }
 
     fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
         DiffRow::Context {
