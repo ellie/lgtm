@@ -3216,45 +3216,57 @@ fn chat_prompt(
     out
 }
 
-fn local_review_prompt(src: &git::LocalSource, patch: &str, review: &LocalReview) -> String {
-    let mut out = String::new();
-    out.push_str(&local_chat_header(src));
-    out.push_str("\n\nThe unified diff under review:\n```diff\n");
-    let (patch, truncated) = truncate_str(patch, MAX_CHAT_PATCH_BYTES);
-    out.push_str(patch);
-    if !patch.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("```\n");
-    if truncated {
-        out.push_str("(patch truncated at 200KB; inspect the working tree for omitted context if needed)\n");
-    }
-    out.push_str("\nLocal review comments:\n");
-    if review.comments.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        let mut comments = review.comments.clone();
-        comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-        for comment in comments {
-            let prefix = if comment.in_reply_to_id.is_some() {
-                "  Reply"
-            } else {
-                "-"
-            };
-            let side = comment.side.as_deref().unwrap_or("RIGHT");
-            let line = comment.line.unwrap_or(0);
-            out.push_str(&format!("{prefix} {}:{line} ({side})\n", comment.path));
-            for body_line in comment.body.lines() {
-                out.push_str("  ");
-                out.push_str(body_line);
-                out.push('\n');
+fn local_review_prompt(review: &LocalReview) -> String {
+    local_review_threads(review)
+        .iter()
+        .map(format_local_thread_prompt)
+        .collect::<Vec<_>>()
+        .join("\n=====\n")
+}
+
+fn local_review_threads(review: &LocalReview) -> Vec<CommentThread> {
+    let mut comments = review.comments.clone();
+    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let mut threads = Vec::new();
+    let mut thread_of: HashMap<u64, usize> = HashMap::new();
+    for comment in comments {
+        match comment.in_reply_to_id {
+            None => {
+                thread_of.insert(comment.id, threads.len());
+                threads.push(CommentThread {
+                    root: comment,
+                    replies: Vec::new(),
+                });
+            }
+            Some(parent) => {
+                if let Some(&ix) = thread_of.get(&parent) {
+                    thread_of.insert(comment.id, ix);
+                    threads[ix].replies.push(comment);
+                }
             }
         }
     }
-    out.push_str(
-        "\nAddress the local review comments. For each requested change, explain the edit you would make and cite the affected file and line.",
-    );
-    out
+    threads
+}
+
+fn format_local_thread_prompt(thread: &CommentThread) -> String {
+    let file = if thread.root.path.is_empty() {
+        "<unknown file>"
+    } else {
+        &thread.root.path
+    };
+    let line = thread.root.line.unwrap_or(0);
+    let mut sections = vec![format!("{file}:L{line}"), thread.root.body.clone()];
+    for (ix, reply) in thread.replies.iter().enumerate() {
+        let author = if reply.user.login.trim().is_empty() {
+            "Unknown"
+        } else {
+            reply.user.login.as_str()
+        };
+        sections.push(format!("Reply {} ({author})", ix + 1));
+        sections.push(reply.body.clone());
+    }
+    sections.join("\n")
 }
 
 /// What a selection pins down for the chat: the anchor triple (path, side,
@@ -5304,7 +5316,7 @@ impl ReviewApp {
         let Some(item) = self.active_item() else {
             return;
         };
-        let Source::Local(src) = &item.source else {
+        let Source::Local(_) = &item.source else {
             return;
         };
         let ItemState::Ready(data) = &item.state else {
@@ -5313,11 +5325,7 @@ impl ReviewApp {
         let Some(local) = &data.local_review else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(
-            src,
-            &data.patch,
-            local,
-        )));
+        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(local)));
     }
 
     /// Refetch only the review comments (not meta/patch), regroup, and
@@ -9261,33 +9269,34 @@ mod tests {
     }
 
     #[test]
-    fn local_review_prompt_includes_patch_and_comments() {
-        let src = git::LocalSource {
-            repo_root: std::path::PathBuf::from("/tmp/lgtm-test"),
-            branch: "feature".to_string(),
-            base_label: "origin/main".to_string(),
-            base_oid: Some("abc".to_string()),
-        };
+    fn local_review_prompt_matches_difit_comment_format() {
         let mut review = LocalReview::default();
         review.add_comment(
             None,
             "src/lib.rs".to_string(),
-            CommentSide::Left,
+            CommentSide::Right,
             7,
             "why remove this?\nplease explain".to_string(),
         );
-
-        let prompt = local_review_prompt(
-            &src,
-            "diff --git a/src/lib.rs b/src/lib.rs\n-old\n",
-            &review,
+        review.add_comment(
+            Some(1),
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            7,
+            "because this path handles nil".to_string(),
         );
-        assert!(prompt.contains(
-            "Local diff under review: repo lgtm-test, branch feature against origin/main."
-        ));
-        assert!(prompt.contains("```diff\ndiff --git a/src/lib.rs b/src/lib.rs\n-old\n```"));
-        assert!(prompt.contains("- src/lib.rs:7 (LEFT)\n  why remove this?\n  please explain\n"));
-        assert!(prompt.contains("Address the local review comments."));
+        review.add_comment(
+            None,
+            "src/main.rs".to_string(),
+            CommentSide::Right,
+            12,
+            "second thread".to_string(),
+        );
+
+        assert_eq!(
+            local_review_prompt(&review),
+            "src/lib.rs:L7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
+        );
     }
 
     #[test]
