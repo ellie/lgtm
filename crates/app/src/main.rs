@@ -26,7 +26,7 @@ use gpui_component::{
     Disableable as _, IconName, Root, Sizable as _, TitleBar,
 };
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -2294,7 +2294,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             (LoadedMeta::Pr(meta), patch, Some(group_comments(comments)))
         }
         Source::Local(src) => {
-            let src = git::resolve_local(&src.repo_root)?;
+            let src = git::resolve_local_with_base(&src.repo_root, src.base_ref.as_deref())?;
             let patch = git::diff_patch(&src)?;
             (LoadedMeta::Local(src), patch, None)
         }
@@ -2600,8 +2600,14 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
         .into_any_element()
 }
 
-fn local_titlebar_content(src: &git::LocalSource, data: &ItemData) -> gpui::AnyElement {
+fn local_titlebar_content(
+    item_id: u64,
+    src: &git::LocalSource,
+    data: &ItemData,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
     let blue: Hsla = theme::blue().into();
+    let repo_root = src.repo_root.clone();
     div()
         .flex()
         .items_center()
@@ -2633,9 +2639,19 @@ fn local_titlebar_content(src: &git::LocalSource, data: &ItemData) -> gpui::AnyE
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(div().text_color(theme::overlay0()).child(SharedString::from(
-                    format!("{} ← {}", src.base_label, src.branch),
-                )))
+                .child(
+                    div()
+                        .id("local-base-picker")
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_color(theme::overlay0())
+                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.6)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_local_base_palette(item_id, repo_root.clone(), window, cx);
+                        }))
+                        .child(SharedString::from(format!("{} ← {}", src.base_label, src.branch))),
+                )
                 .child(
                     div()
                         .text_color(theme::green())
@@ -2658,12 +2674,31 @@ enum PaletteStep {
     RepoInput { error: Option<SharedString> },
     /// Step 3 (GitHub path): pick a PR from the repo's open list.
     PrList { repo: String, prs: PrListState },
+    /// Local path: pick the base ref for an already-open local item.
+    LocalBaseList {
+        item_id: u64,
+        repo_root: PathBuf,
+        current: String,
+        bases: BaseListState,
+    },
 }
 
 enum PrListState {
     Loading,
     Loaded {
         all: Vec<gh::PrSummary>,
+        /// Indices into `all`, fuzzy-filtered by the query, best match first.
+        filtered: Vec<usize>,
+        /// Index into `filtered`.
+        selected: usize,
+    },
+    Failed(String),
+}
+
+enum BaseListState {
+    Loading,
+    Loaded {
+        all: Vec<String>,
         /// Indices into `all`, fuzzy-filtered by the query, best match first.
         filtered: Vec<usize>,
         /// Index into `filtered`.
@@ -2707,6 +2742,21 @@ fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
             );
             matcher.fuzzy_match(&haystack, query).map(|score| (score, ix))
         })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, ix)| ix).collect()
+}
+
+fn filter_base_refs(all: &[String], query: &str) -> Vec<usize> {
+    let query = query.trim();
+    if query.is_empty() {
+        return (0..all.len()).collect();
+    }
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, usize)> = all
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, base)| matcher.fuzzy_match(base, query).map(|score| (score, ix)))
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     scored.into_iter().map(|(_, ix)| ix).collect()
@@ -3583,6 +3633,7 @@ impl ReviewApp {
                 self.set_palette_input(&repo, "owner/repo", window, cx);
                 cx.notify();
             }
+            Some(PaletteStep::LocalBaseList { .. }) => self.close_palette(window, cx),
         }
     }
 
@@ -3597,6 +3648,17 @@ impl ReviewApp {
             }
             Some(PaletteStep::PrList {
                 prs: PrListState::Loaded { filtered, selected, .. },
+                ..
+            }) => {
+                if !filtered.is_empty() {
+                    *selected =
+                        (*selected as isize + delta).clamp(0, filtered.len() as isize - 1) as usize;
+                    self.palette_scroll
+                        .scroll_to_item(*selected, ScrollStrategy::Top);
+                }
+            }
+            Some(PaletteStep::LocalBaseList {
+                bases: BaseListState::Loaded { filtered, selected, .. },
                 ..
             }) => {
                 if !filtered.is_empty() {
@@ -3624,6 +3686,14 @@ impl ReviewApp {
                 ..
             }) => {
                 *filtered = filter_prs(all, &query);
+                *selected = 0;
+                self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            }
+            Some(PaletteStep::LocalBaseList {
+                bases: BaseListState::Loaded { all, filtered, selected },
+                ..
+            }) => {
+                *filtered = filter_base_refs(all, &query);
                 *selected = 0;
                 self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
@@ -3656,6 +3726,13 @@ impl ReviewApp {
             }) => {
                 let selected = *selected;
                 self.palette_open_pr_row(selected, window, cx);
+            }
+            Some(PaletteStep::LocalBaseList {
+                bases: BaseListState::Loaded { selected, .. },
+                ..
+            }) => {
+                let selected = *selected;
+                self.palette_open_base_row(selected, window, cx);
             }
             _ => {}
         }
@@ -3727,6 +3804,63 @@ impl ReviewApp {
         .detach();
     }
 
+    fn open_local_base_palette(
+        &mut self,
+        item_id: u64,
+        repo_root: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| match &item.source {
+                Source::Local(src) => Some(src.base_label.clone()),
+                Source::Pr(_) => None,
+            })
+            .unwrap_or_else(|| "HEAD".to_string());
+        self.palette_gen += 1;
+        let gen = self.palette_gen;
+        self.palette = Some(PaletteStep::LocalBaseList {
+            item_id,
+            repo_root: repo_root.clone(),
+            current,
+            bases: BaseListState::Loading,
+        });
+        self.set_palette_input("", "search base refs…", window, cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { git::list_base_refs(&repo_root) })
+                .await;
+            this.update(cx, |app, cx| {
+                if app.palette_gen != gen {
+                    return;
+                }
+                let query = app.palette_input.read(cx).value().to_string();
+                let Some(PaletteStep::LocalBaseList { bases, .. }) = &mut app.palette else {
+                    return;
+                };
+                *bases = match fetched {
+                    Ok(all) => {
+                        let filtered = filter_base_refs(&all, &query);
+                        BaseListState::Loaded {
+                            all,
+                            filtered,
+                            selected: 0,
+                        }
+                    }
+                    Err(err) => BaseListState::Failed(format!("{err:#}")),
+                };
+                app.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Open the PR at `pos` in the filtered list as a new review item.
     fn palette_open_pr_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(PaletteStep::PrList {
@@ -3751,6 +3885,50 @@ impl ReviewApp {
         self.open_item(source, cx);
     }
 
+    fn palette_open_base_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(PaletteStep::LocalBaseList {
+            item_id,
+            repo_root,
+            bases: BaseListState::Loaded { all, filtered, .. },
+            ..
+        }) = &self.palette
+        else {
+            return;
+        };
+        let Some(&ix) = filtered.get(pos) else {
+            return;
+        };
+        let (item_id, repo_root, base_ref) = (*item_id, repo_root.clone(), all[ix].clone());
+        self.close_palette(window, cx);
+        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
+            return;
+        };
+        let mode = match &item.state {
+            ItemState::Ready(data) => data.mode,
+            _ => ViewMode::Split,
+        };
+        let branch = match &item.source {
+            Source::Local(src) => src.branch.clone(),
+            Source::Pr(_) => dir_name(&repo_root),
+        };
+        let source = Source::Local(git::LocalSource {
+            repo_root,
+            branch,
+            base_ref: Some(base_ref.clone()),
+            base_label: base_ref,
+            base_oid: None,
+        });
+        item.source = source.clone();
+        item.refresh_error = None;
+        match item.state {
+            ItemState::Failed(_) => item.state = ItemState::Loading,
+            ItemState::Loading => {}
+            ItemState::Ready(_) => item.reloading = true,
+        }
+        Self::spawn_fetch(item_id, source, mode, cx);
+        cx.notify();
+    }
+
     /// Native directory picker. The chosen path becomes a Local item through
     /// the normal add-item path; fetch_item re-resolves it on the background
     /// executor, so a non-repo directory surfaces as a Failed item.
@@ -3771,6 +3949,7 @@ impl ReviewApp {
             this.update(cx, |app, cx| {
                 let source = Source::Local(git::LocalSource {
                     branch: dir_name(&path),
+                    base_ref: None,
                     base_label: "…".to_string(),
                     base_oid: None,
                     repo_root: path,
@@ -5283,7 +5462,7 @@ impl ReviewApp {
                         Some(meta) => pr_titlebar_content(meta, cx),
                         None => app_title(None),
                     },
-                    Source::Local(src) => local_titlebar_content(src, data),
+                    Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
                 },
                 ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
                 ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
@@ -5562,6 +5741,7 @@ impl ReviewApp {
             PaletteStep::Sources { .. } => None,
             PaletteStep::RepoInput { .. } => Some("Open GitHub pull request".into()),
             PaletteStep::PrList { repo, .. } => Some(repo.clone().into()),
+            PaletteStep::LocalBaseList { .. } => Some("Choose local diff base".into()),
         };
 
         let body: gpui::AnyElement = match step {
@@ -5661,6 +5841,102 @@ impl ReviewApp {
                                     .filter_map(|pos| Some((pos, &all[*filtered.get(pos)?])))
                                     .map(|(pos, pr)| {
                                         palette_pr_row(pr, pos, pos == *selected, entity.clone())
+                                    })
+                                    .collect()
+                            })
+                            .track_scroll(self.palette_scroll.clone())
+                            .h_full(),
+                        )
+                        .into_any_element()
+                }
+            },
+            PaletteStep::LocalBaseList { bases, .. } => match bases {
+                BaseListState::Loading => div()
+                    .px_3()
+                    .py_2()
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from("loading base refs…"))
+                    .into_any_element(),
+                BaseListState::Failed(msg) => div()
+                    .px_3()
+                    .py_2()
+                    .text_color(theme::red())
+                    .child(SharedString::from(msg.clone()))
+                    .into_any_element(),
+                BaseListState::Loaded { filtered, .. } if filtered.is_empty() => div()
+                    .px_3()
+                    .py_2()
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from("no matching base refs"))
+                    .into_any_element(),
+                BaseListState::Loaded { filtered, .. } => {
+                    let entity = cx.entity();
+                    let count = filtered.len();
+                    div()
+                        .py_1()
+                        .h(px(count.min(10) as f32 * PALETTE_ROW_HEIGHT + 8.))
+                        .child(
+                            uniform_list("palette-bases", count, move |range, _window, cx| {
+                                let this = entity.read(cx);
+                                let Some(PaletteStep::LocalBaseList {
+                                    current,
+                                    bases: BaseListState::Loaded { all, filtered, selected },
+                                    ..
+                                }) = &this.palette
+                                else {
+                                    return Vec::new();
+                                };
+                                range
+                                    .filter_map(|pos| {
+                                        let base = all.get(*filtered.get(pos)?)?;
+                                        Some((pos, base.clone(), base == current))
+                                    })
+                                    .map(|(pos, base, is_current)| {
+                                        div()
+                                            .id(("palette-base", pos))
+                                            .mx_1()
+                                            .px_2()
+                                            .h(px(PALETTE_ROW_HEIGHT))
+                                            .rounded_md()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .cursor_pointer()
+                                            .when(pos == *selected, |row| row.bg(theme::surface0()))
+                                            .when(pos != *selected, |row| {
+                                                row.hover(|style| {
+                                                    style.bg(Hsla::from(theme::surface0()).opacity(0.5))
+                                                })
+                                            })
+                                            .on_click({
+                                                let entity = entity.clone();
+                                                move |_, window, cx| {
+                                                    entity.update(cx, |this, cx| {
+                                                        this.palette_open_base_row(pos, window, cx)
+                                                    });
+                                                }
+                                            })
+                                            .child(
+                                                div()
+                                                    .w(px(8.))
+                                                    .h(px(8.))
+                                                    .flex_shrink_0()
+                                                    .rounded_full()
+                                                    .bg(if is_current {
+                                                        theme::green()
+                                                    } else {
+                                                        theme::overlay0()
+                                                    }),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_color(theme::text())
+                                                    .child(SharedString::from(base)),
+                                            )
+                                            .into_any_element()
                                     })
                                     .collect()
                             })
@@ -7471,6 +7747,7 @@ mod tests {
         let src = git::LocalSource {
             repo_root: "/tmp/myrepo".into(),
             branch: "feature".into(),
+            base_ref: None,
             base_label: "origin/main".into(),
             base_oid: None,
         };
