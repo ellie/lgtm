@@ -197,11 +197,29 @@ pub fn diff_patch(src: &LocalSource) -> Result<String> {
         // `--no-index` against /dev/null renders an untracked file as an
         // added-file diff; it exits 1 when the sides differ, which is success
         // here (0 would mean an empty file — also fine, git emits a header).
+        // Run from the file's parent directory with just the basename so the
+        // patch path is the bare filename — `git diff --no-index` would
+        // otherwise prepend `1/` and `2/` and (worse) re-include the leading
+        // directory components, breaking the diff header the parser expects.
+        let file_path = Path::new(file);
+        let (dir, base): (&Path, &Path) = match file_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                (parent, file_path.file_name().map(Path::new).unwrap_or(file_path))
+            }
+            _ => (Path::new(""), file_path),
+        };
         let output = Command::new("git")
             .arg("-C")
-            .arg(&src.repo_root)
-            .args(["diff", "--no-color", "--no-ext-diff", "--no-index", "--", "/dev/null"])
-            .arg(file)
+            .arg(src.repo_root.join(dir))
+            .args([
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                "/dev/null",
+            ])
+            .arg(base)
             .output()
             .map_err(|err| anyhow!("failed to run git: {err}"))?;
         if !matches!(output.status.code(), Some(0) | Some(1)) {

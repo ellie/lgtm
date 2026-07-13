@@ -316,16 +316,61 @@ fn parse_git_paths(rest: &str) -> (Option<String>, Option<String>) {
         let new = strip_side(&rest[pos + 1..]);
         return (old, new);
     }
+    // Git 2.45+ switched the default `diff --git` prefix from `a/`/`b/` to
+    // `c/`/`w/` (commit/worktree) to avoid colliding with tracked paths that
+    // happen to begin with `a/`. `git config diff.mnemonicPrefix` can force
+    // the old form, but we accept both.
+    if let Some(pos) = rest.find(" w/") {
+        let old = strip_side(&rest[..pos]);
+        let new = strip_side(&rest[pos + 1..]);
+        return (old, new);
+    }
+    // `git diff --no-index` produces `1/path 2/path` (no `a/`/`b/` prefix).
+    // Split on the first space between two `<digit>/…` tokens.
+    let (old, new) = parse_noindex_paths(rest);
+    if old.is_some() || new.is_some() {
+        return (old, new);
+    }
     (None, None)
 }
 
+/// Split `1/foo 2/foo` (or `1/foo 2/foo/bar`) into `(foo, foo)` /
+/// `(foo, foo/bar)`. Both halves must start with `<single-digit>/` for this
+/// form to apply — otherwise a path containing "1/" or "2/" mid-string could
+/// match by accident.
+fn parse_noindex_paths(rest: &str) -> (Option<String>, Option<String>) {
+    let mut split = rest.splitn(2, ' ');
+    let (Some(old), Some(new)) = (split.next(), split.next()) else {
+        return (None, None);
+    };
+    if !looks_like_noindex_side(old) || !looks_like_noindex_side(new) {
+        return (None, None);
+    }
+    (strip_side(old), strip_side(new))
+}
+
+fn looks_like_noindex_side(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_digit())
+        && chars.next() == Some('/')
+}
+
 fn strip_side(path: &str) -> Option<String> {
+    if looks_like_noindex_side(path) {
+        // `git diff --no-index` prepends `1/` or `2/`, not `a/`/`b/`.
+        return path.split_once('/').map(|(_, rest)| rest.to_string());
+    }
     path.strip_prefix("a/")
         .or_else(|| path.strip_prefix("b/"))
+        // Git 2.45+ default prefixes: `c/` (commit) and `w/` (worktree).
+        .or_else(|| path.strip_prefix("c/"))
+        .or_else(|| path.strip_prefix("w/"))
         .map(str::to_string)
 }
 
-/// Path from a `---`/`+++` marker: `a/path`, `b/path`, `/dev/null`, maybe quoted.
+/// Path from a `---`/`+++` marker: `a/path`, `b/path`, `1/path` / `2/path`
+/// (the latter only when `git diff --no-index` produced the patch), `/dev/null`,
+/// maybe quoted.
 fn parse_marker_path(p: &str) -> Option<String> {
     let p = p.trim_end();
     let p = p.strip_prefix('"').unwrap_or(p);
@@ -536,6 +581,51 @@ index 6666666..7777777 100644
 -x
 +y
 ";
+
+    #[test]
+    fn parses_mnemonic_prefix_diff_for_git_245_plus() {
+        // Git 2.45+ default prefixes: `c/` (commit side) and `w/`
+        // (worktree side). The path must come out bare, no `c/`/`w/` prefix.
+        let sample = "\
+diff --git c/src/main.rs w/src/main.rs
+index 1111111..2222222 100644
+--- c/src/main.rs
++++ w/src/main.rs
+@@ -1,1 +1,1 @@
+-let foo = 1;
++let bar = 1;
+";
+        let diff = parse_patch(sample);
+        assert_eq!(diff.files.len(), 1);
+        let f = &diff.files[0];
+        assert_eq!(f.display_path(), "src/main.rs");
+        assert_eq!(f.old_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(f.new_path.as_deref(), Some("src/main.rs"));
+        assert_eq!(f.status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn parses_noindex_diff_for_untracked_files() {
+        // git diff --no-index -- /dev/null new.txt emits this header form.
+        let noindex = "\
+diff --git 1/new.txt 2/new.txt
+new file mode 100644
+index 0000000..ce01362
+--- /dev/null
++++ 2/new.txt
+@@ -0,0 +1,1 @@
++hello
+";
+        let diff = parse_patch(noindex);
+        assert_eq!(diff.files.len(), 1);
+        let f = &diff.files[0];
+        // Header's `1/` and `2/` prefixes must be stripped, not stored.
+        assert_eq!(f.display_path(), "new.txt");
+        assert_eq!(f.old_path, None);
+        assert_eq!(f.new_path.as_deref(), Some("new.txt"));
+        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!((f.additions, f.deletions), (1, 0));
+    }
 
     #[test]
     fn parses_files_hunks_and_rows() {
