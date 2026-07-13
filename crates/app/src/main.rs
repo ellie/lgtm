@@ -1,22 +1,17 @@
+mod lsp_client;
 mod theme;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail, Context as _};
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
     actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy,
-    ScrollWheelEvent, SharedString, StyledText, Subscription, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
+    SharedString, StyledText, Subscription, TextRun, TitlebarOptions, UniformListScrollHandle,
+    Window, WindowBounds, WindowOptions,
 };
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     input::{Escape as InputEscape, Input, InputEvent, InputState},
@@ -25,8 +20,20 @@ use gpui_component::{
     tag::Tag,
     Disableable as _, IconName, Root, Sizable as _, TitleBar,
 };
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+
+use lsp_client::{
+    trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession,
+};
 
 const MONO: &str = "Menlo";
 const ROW_HEIGHT: f32 = 22.0;
@@ -42,15 +49,48 @@ const SPLIT_DIVIDER: f32 = 6.0;
 actions!(
     lgtm,
     [
-        NextFile, PrevFile, NextHunk, PrevHunk, GoToTop, GoToBottom, ToggleView, Quit,
-        ToggleSidebar, OpenInput, CloseItem, NextItem, PrevItem, Refresh, OpenPalette, PaletteUp,
-        PaletteDown, PaletteBack, ClearSelection, CopySelection, FocusTreeFilter, ToggleMinimap,
-        ToggleComments, ToggleChat, SubmitReview
+        NextFile,
+        PrevFile,
+        NextHunk,
+        PrevHunk,
+        GoToTop,
+        GoToBottom,
+        ToggleView,
+        Quit,
+        ToggleSidebar,
+        OpenInput,
+        CloseItem,
+        NextItem,
+        PrevItem,
+        Refresh,
+        OpenPalette,
+        PaletteUp,
+        PaletteDown,
+        PaletteBack,
+        ClearSelection,
+        CopySelection,
+        FocusTreeFilter,
+        ToggleMinimap,
+        ToggleComments,
+        ToggleChat,
+        SubmitReview,
+        GoToDefinition,
+        NavBack,
+        NavForward
     ]
 );
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [mode, root] = args.as_slice() {
+        if mode == "--bifrost-lsp-server" {
+            if let Err(err) = brokk_bifrost::lsp::run_lsp_stdio_server(PathBuf::from(root)) {
+                eprintln!("lgtm: embedded Bifrost LSP failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+    }
     let mut sources = Vec::new();
     let mut errors = Vec::new();
     if args.is_empty() {
@@ -101,8 +141,13 @@ fn main() {
                 // palette's own escape routing wins by construction.
                 KeyBinding::new("escape", ClearSelection, Some("ReviewApp")),
                 KeyBinding::new("cmd-c", CopySelection, Some("ReviewApp")),
+                KeyBinding::new("f12", GoToDefinition, Some("ReviewApp")),
                 KeyBinding::new("ctrl-tab", NextItem, Some("ReviewApp")),
                 KeyBinding::new("ctrl-shift-tab", PrevItem, Some("ReviewApp")),
+                KeyBinding::new("cmd-left", NavBack, Some("ReviewApp")),
+                KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
+                KeyBinding::new("alt-left", NavBack, Some("ReviewApp")),
+                KeyBinding::new("alt-right", NavForward, Some("ReviewApp")),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
@@ -223,7 +268,9 @@ enum Row {
     },
     /// One soft-wrapped line of a comment body (wrapped at
     /// [`COMMENT_WRAP_CHARS`] when the rows are built).
-    CommentBody { line: SharedString },
+    CommentBody {
+        line: SharedString,
+    },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
     CommentActions {
@@ -540,8 +587,16 @@ fn row_selection_range(sel: &Selection, row_ix: usize, row: &Row) -> Option<Rang
     }
     let text = row_side_text(row, sel.side)?;
     let chars = text.chars().count();
-    let start_col = if row_ix == start.row { start.col.min(chars) } else { 0 };
-    let end_col = if row_ix == end.row { end.col.min(chars) } else { chars };
+    let start_col = if row_ix == start.row {
+        start.col.min(chars)
+    } else {
+        0
+    };
+    let end_col = if row_ix == end.row {
+        end.col.min(chars)
+    } else {
+        chars
+    };
     if start_col > end_col {
         return None;
     }
@@ -677,15 +732,27 @@ fn gap_span(hunks: &[Hunk], gap_ix: usize, total_new: u32) -> (u32, u32, u32) {
         (1, 1)
     } else {
         let h = &hunks[gap_ix - 1];
-        let pre_old = if h.old_count == 0 { h.old_start } else { h.old_start - 1 };
-        let pre_new = if h.new_count == 0 { h.new_start } else { h.new_start - 1 };
+        let pre_old = if h.old_count == 0 {
+            h.old_start
+        } else {
+            h.old_start - 1
+        };
+        let pre_new = if h.new_count == 0 {
+            h.new_start
+        } else {
+            h.new_start - 1
+        };
         (pre_old + h.old_count + 1, pre_new + h.new_count + 1)
     };
     let new_hi = if gap_ix == hunks.len() {
         total_new
     } else {
         let h = &hunks[gap_ix];
-        if h.new_count == 0 { h.new_start } else { h.new_start - 1 }
+        if h.new_count == 0 {
+            h.new_start
+        } else {
+            h.new_start - 1
+        }
     };
     (old_lo, new_lo, (new_hi + 1).saturating_sub(new_lo))
 }
@@ -813,7 +880,15 @@ fn build_rows(
         for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
             if let Some(upgrade) = upgrade {
                 push_gap_rows(
-                    &mut rows, upgrade, &file.hunks, file_ix, hunk_ix, mode, path, anchors, now,
+                    &mut rows,
+                    upgrade,
+                    &file.hunks,
+                    file_ix,
+                    hunk_ix,
+                    mode,
+                    path,
+                    anchors,
+                    now,
                 );
             }
             let syntax_spans = match upgrade {
@@ -919,12 +994,20 @@ fn build_rows(
                                     }),
                                 });
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Left, Some(*old_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Left,
+                                    Some(*old_no),
+                                    now,
                                 );
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Right, Some(*new_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Right,
+                                    Some(*new_no),
+                                    now,
                                 );
                                 i += 1;
                             }
@@ -945,27 +1028,29 @@ fn build_rows(
                                     }),
                                 });
                                 push_thread_rows(
-                                    &mut rows, anchors, path,
-                                    CommentSide::Right, Some(*new_no), now,
+                                    &mut rows,
+                                    anchors,
+                                    path,
+                                    CommentSide::Right,
+                                    Some(*new_no),
+                                    now,
                                 );
                                 i += 1;
                             }
                             DiffRow::Removed { .. } => {
                                 let start = i;
-                                while i < hrows.len()
-                                    && matches!(hrows[i], DiffRow::Removed { .. })
+                                while i < hrows.len() && matches!(hrows[i], DiffRow::Removed { .. })
                                 {
                                     i += 1;
                                 }
                                 let mid = i;
-                                while i < hrows.len() && matches!(hrows[i], DiffRow::Added { .. })
-                                {
+                                while i < hrows.len() && matches!(hrows[i], DiffRow::Added { .. }) {
                                     i += 1;
                                 }
                                 let (removed, added) = (mid - start, i - mid);
                                 for pair in 0..removed.max(added) {
-                                    let left = (pair < removed).then(|| {
-                                        match &hrows[start + pair] {
+                                    let left =
+                                        (pair < removed).then(|| match &hrows[start + pair] {
                                             DiffRow::Removed {
                                                 old_no,
                                                 text,
@@ -978,34 +1063,39 @@ fn build_rows(
                                                 syntax: syntax_spans[start + pair].clone(),
                                             },
                                             _ => unreachable!(),
-                                        }
-                                    });
-                                    let right = (pair < added).then(|| {
-                                        match &hrows[mid + pair] {
-                                            DiffRow::Added {
-                                                new_no,
-                                                text,
-                                                intra,
-                                            } => Cell {
-                                                no: *new_no,
-                                                kind: LineKind::Added,
-                                                text: text.clone().into(),
-                                                intra: intra.clone(),
-                                                syntax: syntax_spans[mid + pair].clone(),
-                                            },
-                                            _ => unreachable!(),
-                                        }
+                                        });
+                                    let right = (pair < added).then(|| match &hrows[mid + pair] {
+                                        DiffRow::Added {
+                                            new_no,
+                                            text,
+                                            intra,
+                                        } => Cell {
+                                            no: *new_no,
+                                            kind: LineKind::Added,
+                                            text: text.clone().into(),
+                                            intra: intra.clone(),
+                                            syntax: syntax_spans[mid + pair].clone(),
+                                        },
+                                        _ => unreachable!(),
                                     });
                                     let left_no = left.as_ref().map(|cell| cell.no);
                                     let right_no = right.as_ref().map(|cell| cell.no);
                                     rows.push(Row::SplitLine { left, right });
                                     push_thread_rows(
-                                        &mut rows, anchors, path,
-                                        CommentSide::Left, left_no, now,
+                                        &mut rows,
+                                        anchors,
+                                        path,
+                                        CommentSide::Left,
+                                        left_no,
+                                        now,
                                     );
                                     push_thread_rows(
-                                        &mut rows, anchors, path,
-                                        CommentSide::Right, right_no, now,
+                                        &mut rows,
+                                        anchors,
+                                        path,
+                                        CommentSide::Right,
+                                        right_no,
+                                        now,
                                     );
                                 }
                             }
@@ -1016,7 +1106,14 @@ fn build_rows(
         }
         if let Some(upgrade) = upgrade {
             push_gap_rows(
-                &mut rows, upgrade, &file.hunks, file_ix, file.hunks.len(), mode, path, anchors,
+                &mut rows,
+                upgrade,
+                &file.hunks,
+                file_ix,
+                file.hunks.len(),
+                mode,
+                path,
+                anchors,
                 now,
             );
         }
@@ -1026,7 +1123,14 @@ fn build_rows(
 }
 
 /// Per-kind row tint, word-highlight tint, gutter marker, and marker color.
-fn kind_style(kind: LineKind) -> (Option<gpui::Rgba>, Option<gpui::Rgba>, &'static str, gpui::Rgba) {
+fn kind_style(
+    kind: LineKind,
+) -> (
+    Option<gpui::Rgba>,
+    Option<gpui::Rgba>,
+    &'static str,
+    gpui::Rgba,
+) {
     match kind {
         LineKind::Context => (None, None, "", theme::overlay0()),
         LineKind::Added => (
@@ -1100,9 +1204,7 @@ fn merge_highlights(
         }
         match out.last_mut() {
             // Coalesce adjacent identically-styled segments.
-            Some((prev, prev_style)) if prev.end == start && *prev_style == style => {
-                prev.end = end
-            }
+            Some((prev, prev_style)) if prev.end == start && *prev_style == style => prev.end = end,
             _ => out.push((start..end, style)),
         }
     }
@@ -1301,7 +1403,10 @@ fn render_row(
             if *comments > 0 || *outdated > 0 {
                 let mut note = String::new();
                 if *comments > 0 {
-                    note = format!("{comments} comment{}", if *comments == 1 { "" } else { "s" });
+                    note = format!(
+                        "{comments} comment{}",
+                        if *comments == 1 { "" } else { "s" }
+                    );
                 }
                 if *outdated > 0 {
                     if !note.is_empty() {
@@ -1389,15 +1494,13 @@ fn render_row(
                         .text_color(marker_color)
                         .child(SharedString::from(marker)),
                 )
-                .child(
-                    div().whitespace_nowrap().child(line_content(
-                        text,
-                        syntax,
-                        intra,
-                        word_bg,
-                        selection.map(|(_, range)| range),
-                    )),
-                )
+                .child(div().whitespace_nowrap().child(line_content(
+                    text,
+                    syntax,
+                    intra,
+                    word_bg,
+                    selection.map(|(_, range)| range),
+                )))
                 .into_any_element()
         }
         Row::SplitLine { left, right } => {
@@ -1550,9 +1653,8 @@ fn minimap_rows(rows: &[Row]) -> Vec<MinimapRow> {
                 len_frac: line_frac(text),
             },
             Row::SplitLine { left, right } => {
-                let frac = |cell: &Option<Cell>| {
-                    cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.)
-                };
+                let frac =
+                    |cell: &Option<Cell>| cell.as_ref().map(|c| line_frac(&c.text)).unwrap_or(0.);
                 let (left_frac, right_frac) = (frac(left), frac(right));
                 MinimapRow {
                     kind: MinimapKind::SplitPair {
@@ -1652,9 +1754,9 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
         for row in chunk {
             let mut fold = |lane: MinimapLane, color: MinimapColor, f: f32| {
                 let ix = lane as usize;
-                if winner[ix]
-                    .map_or(true, |best| minimap_priority(color) > minimap_priority(best))
-                {
+                if winner[ix].map_or(true, |best| {
+                    minimap_priority(color) > minimap_priority(best)
+                }) {
                     winner[ix] = Some(color);
                 }
                 frac[ix] = frac[ix].max(f);
@@ -1727,7 +1829,11 @@ fn minimap_runs(rows: &[MinimapRow], pane_px: f32) -> MinimapLayout {
             });
         }
     }
-    MinimapLayout { slot_h, group, runs }
+    MinimapLayout {
+        slot_h,
+        group,
+        runs,
+    }
 }
 
 // --- Sidebar file tree ---------------------------------------------------
@@ -1922,7 +2028,11 @@ fn render_tree_row(
             });
             match &entry.kind {
                 TreeEntryKind::Dir { path } => {
-                    let chevron = if data.collapsed.contains(path) { "▸" } else { "▾" };
+                    let chevron = if data.collapsed.contains(path) {
+                        "▸"
+                    } else {
+                        "▾"
+                    };
                     base.child(
                         div()
                             .w(px(12.))
@@ -2037,6 +2147,17 @@ struct ItemData {
     /// scrolls the tree when the viewport's file changes — never while the
     /// user scrolls the tree themselves.
     tree_last_file: Option<usize>,
+    lsp: Option<LspHandle>,
+    lsp_progress: Option<Arc<Mutex<LspProgress>>>,
+    lsp_loading: bool,
+    lsp_error: Option<SharedString>,
+    hover: Option<HoverState>,
+    hover_gen: u64,
+    hover_cancel: Option<Arc<AtomicBool>>,
+    last_symbol_target: Option<SymbolTarget>,
+    source_view: Option<SourceViewState>,
+    nav_back: Vec<NavLocation>,
+    nav_forward: Vec<NavLocation>,
 }
 
 impl ItemData {
@@ -2074,10 +2195,11 @@ impl ItemData {
         self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
         let new_top = nth_noncomment_row(&self.rows, top_base);
-        self.scroll.0.borrow().base_handle.set_offset(point(
-            offset.x,
-            px(-(new_top as f32 * ROW_HEIGHT + frac)),
-        ));
+        self.scroll
+            .0
+            .borrow()
+            .base_handle
+            .set_offset(point(offset.x, px(-(new_top as f32 * ROW_HEIGHT + frac))));
     }
 
     /// The minimap quad runs for this pane height, from the cache when the
@@ -2118,6 +2240,8 @@ struct ReviewItem {
     /// Bumped whenever fresh data is installed; an in-flight Phase-2 upgrade
     /// only lands if the generation it captured is still current.
     upgrade_gen: u64,
+    /// Bumped whenever LSP root/session startup is restarted.
+    lsp_gen: u64,
 }
 
 impl ReviewItem {
@@ -2241,6 +2365,17 @@ impl ReviewItem {
                     collapsed: HashSet::new(),
                     tree_scroll: UniformListScrollHandle::new(),
                     tree_last_file: None,
+                    lsp: None,
+                    lsp_progress: None,
+                    lsp_loading: false,
+                    lsp_error: None,
+                    hover: None,
+                    hover_gen: 0,
+                    hover_cancel: None,
+                    last_symbol_target: None,
+                    source_view: None,
+                    nav_back: Vec::new(),
+                    nav_forward: Vec::new(),
                 });
                 data.rebuild_tree();
                 self.state = ItemState::Ready(data);
@@ -2300,7 +2435,8 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
         }
     };
     let diff = diff_core::parse_patch(&patch);
-    let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
+    let (rows, file_rows, hunk_rows) =
+        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
     Ok(Loaded {
         meta,
         diff,
@@ -2386,7 +2522,11 @@ fn run_upgrade(source: &UpgradeSource, mut jobs: Vec<UpgradeJob>) -> Vec<Upgrade
 /// binary/non-UTF-8, over the size cap, or a fetch failure.
 fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
     let text = match source {
-        UpgradeSource::Pr { loc, base_oid, head_oid } => {
+        UpgradeSource::Pr {
+            loc,
+            base_oid,
+            head_oid,
+        } => {
             let oid = if old { base_oid } else { head_oid };
             match gh::fetch_file_at(loc, oid, path) {
                 Ok(text) => text?,
@@ -2434,14 +2574,15 @@ fn upgrade_file(source: &UpgradeSource, job: &UpgradeJob) -> Option<UpgradedFile
     let new_text = normalize(new_text);
 
     let hunks = diff_texts(&old_text, &new_text, 3);
-    let (additions, deletions) = hunks
-        .iter()
-        .flat_map(|hunk| &hunk.rows)
-        .fold((0, 0), |(a, d), row| match row {
-            DiffRow::Added { .. } => (a + 1, d),
-            DiffRow::Removed { .. } => (a, d + 1),
-            DiffRow::Context { .. } => (a, d),
-        });
+    let (additions, deletions) =
+        hunks
+            .iter()
+            .flat_map(|hunk| &hunk.rows)
+            .fold((0, 0), |(a, d), row| match row {
+                DiffRow::Added { .. } => (a + 1, d),
+                DiffRow::Removed { .. } => (a, d + 1),
+                DiffRow::Context { .. } => (a, d),
+            });
 
     let path = job.new_path.as_deref().or(job.old_path.as_deref())?;
     let lang = syntax::language_for_path(path);
@@ -2565,9 +2706,14 @@ fn pr_titlebar_content(meta: &gh::PrMeta, cx: &mut Context<ReviewApp>) -> gpui::
                 .gap_2()
                 .flex_shrink_0()
                 .pr_3()
-                .child(div().text_color(theme::overlay0()).child(SharedString::from(
-                    format!("{} ← {}", meta.base_ref_name, meta.head_ref_name),
-                )))
+                .child(
+                    div()
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(format!(
+                            "{} ← {}",
+                            meta.base_ref_name, meta.head_ref_name
+                        ))),
+                )
                 .child(
                     div()
                         .text_color(theme::green())
@@ -2740,7 +2886,9 @@ fn filter_prs(all: &[gh::PrSummary], query: &str) -> Vec<usize> {
                 "#{} {} {} {}",
                 pr.number, pr.title, pr.author.login, pr.head_ref_name
             );
-            matcher.fuzzy_match(&haystack, query).map(|score| (score, ix))
+            matcher
+                .fuzzy_match(&haystack, query)
+                .map(|score| (score, ix))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
@@ -2983,7 +3131,11 @@ fn local_chat_header(src: &git::LocalSource) -> String {
 /// The full prompt for one turn. `context` (header + raw patch) is only
 /// present on a session's first message; the patch is capped at
 /// [`MAX_CHAT_PATCH_BYTES`] with the truncation noted in the prompt.
-fn chat_prompt(context: Option<(&str, &str)>, selection_block: Option<&str>, question: &str) -> String {
+fn chat_prompt(
+    context: Option<(&str, &str)>,
+    selection_block: Option<&str>,
+    question: &str,
+) -> String {
     let mut out = String::new();
     if let Some((header, patch)) = context {
         out.push_str(header);
@@ -3027,7 +3179,10 @@ impl SelectionInfo {
     }
 
     fn note(&self) -> String {
-        format!("› included selection: {}:{}-{}", self.path, self.lo, self.hi)
+        format!(
+            "› included selection: {}:{}-{}",
+            self.path, self.lo, self.hi
+        )
     }
 }
 
@@ -3072,7 +3227,13 @@ fn selection_info(
         SelSide::Left => "LEFT (old)",
         SelSide::Right => "RIGHT (new)",
     };
-    Some(SelectionInfo { path, side, lo, hi, text })
+    Some(SelectionInfo {
+        path,
+        side,
+        lo,
+        hi,
+        text,
+    })
 }
 
 /// Scratch dir for one item's materialized exploration files. Includes the
@@ -3117,6 +3278,100 @@ fn materialize_files(root: &Path, files: &[(String, String)]) -> Option<std::pat
     Some(root.to_path_buf())
 }
 
+fn lsp_root_for_source(source: &Source, pr_meta: Option<&gh::PrMeta>) -> anyhow::Result<PathBuf> {
+    match source {
+        Source::Local(src) => Ok(src.repo_root.clone()),
+        Source::Pr(loc) => {
+            let meta = pr_meta.context("PR metadata missing; cannot materialize LSP worktree")?;
+            if meta.head_ref_oid.is_empty() {
+                bail!("PR head oid missing; cannot materialize LSP worktree");
+            }
+            materialize_pr_worktree(loc, &meta.head_ref_oid)
+        }
+    }
+}
+
+fn materialize_pr_worktree(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
+    let root = lsp_worktree_root(loc, head_oid)?;
+    let pull_ref = format!("refs/pull/{}/head", loc.number);
+    if root.join(".git").exists() {
+        git_ok(&root, &["fetch", "--depth", "1", "origin", &pull_ref]).ok();
+        git_ok(&root, &["checkout", "--detach", head_oid])?;
+        return Ok(root);
+    }
+    let parent = root
+        .parent()
+        .context("worktree root unexpectedly has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = root.with_extension(format!("tmp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    git_ok(
+        parent,
+        &[
+            "clone",
+            "--no-checkout",
+            "--filter=blob:none",
+            &format!("https://github.com/{}.git", loc.repo_slug()),
+            tmp.file_name()
+                .and_then(|name| name.to_str())
+                .context("temporary worktree path is not UTF-8")?,
+        ],
+    )?;
+    git_ok(&tmp, &["fetch", "--depth", "1", "origin", &pull_ref])?;
+    git_ok(&tmp, &["checkout", "--detach", head_oid])?;
+    std::fs::rename(&tmp, &root).or_else(|_| {
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::rename(&tmp, &root)
+    })?;
+    Ok(root)
+}
+
+fn lsp_worktree_root(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is not set")?;
+    let key = format!(
+        "{}__{}__pr{}__{}",
+        sanitize_path_part(&loc.owner),
+        sanitize_path_part(&loc.repo),
+        loc.number,
+        &head_oid[..head_oid.len().min(12)]
+    );
+    Ok(PathBuf::from(home)
+        .join(".cache")
+        .join("lgtm")
+        .join("worktrees")
+        .join(key))
+}
+
+fn sanitize_path_part(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn git_ok(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .map_err(|err| anyhow!("failed to run git: {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// How the next chat run gets its exploration dir, decided at send time.
 enum ExplorePlan {
     /// No tools: patch-only context.
@@ -3131,6 +3386,117 @@ enum ExplorePlan {
         files: Vec<(String, String)>,
     },
 }
+
+#[derive(Clone)]
+struct LspHandle {
+    root: PathBuf,
+    session: LspSession,
+    progress: Arc<Mutex<LspProgress>>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct SymbolTarget {
+    position: LspPosition,
+    row: usize,
+    col: usize,
+}
+
+#[derive(Clone)]
+struct HoverState {
+    result: Option<HoverResult>,
+    loading: bool,
+    mouse: Point<Pixels>,
+}
+
+#[derive(Clone)]
+struct SourceViewState {
+    target: DefinitionTarget,
+    lines: Vec<SharedString>,
+    scroll: UniformListScrollHandle,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum NavLocation {
+    Diff { row: usize },
+    Source { target: DefinitionTarget },
+}
+
+fn utf16_col_for_monospace_col(text: &str, col: usize) -> u32 {
+    text.chars().take(col).map(|ch| ch.len_utf16() as u32).sum()
+}
+
+fn identifier_start_at(text: &str, col: usize) -> Option<usize> {
+    let chars = text.chars().collect::<Vec<_>>();
+    let is_identifier = |ch: char| ch == '_' || ch.is_alphanumeric();
+    let mut cursor = col.min(chars.len());
+    if chars.get(cursor).is_none_or(|ch| !is_identifier(*ch)) {
+        if chars.get(cursor).is_none_or(|ch| ch.is_whitespace()) {
+            return None;
+        }
+        cursor = cursor.checked_sub(1)?;
+        if !is_identifier(chars[cursor]) {
+            return None;
+        }
+    }
+    while cursor > 0 && is_identifier(chars[cursor - 1]) {
+        cursor -= 1;
+    }
+    Some(cursor)
+}
+
+fn lsp_warmup_position(data: &ItemData) -> Option<LspPosition> {
+    for (row_ix, row) in data.rows.iter().enumerate() {
+        let (line, text) = match row {
+            Row::Line { new_no, text, .. } => ((*new_no)? - 1, text.as_ref()),
+            Row::SplitLine {
+                right: Some(cell), ..
+            } => (cell.no - 1, cell.text.as_ref()),
+            _ => continue,
+        };
+        let file_ix = data.file_rows.iter().rposition(|&row| row <= row_ix)?;
+        let path = data.diff.files.get(file_ix)?.new_path.as_ref()?.clone();
+        let col = first_lsp_identifier_col(text)?;
+        return Some(LspPosition {
+            path,
+            line,
+            character: col,
+        });
+    }
+    None
+}
+
+fn first_lsp_identifier_col(text: &str) -> Option<u32> {
+    let mut chars = text.char_indices().peekable();
+    while let Some((start_byte, ch)) = chars.next() {
+        if !(ch == '_' || ch.is_ascii_alphabetic()) {
+            continue;
+        }
+        let mut end_byte = start_byte + ch.len_utf8();
+        while let Some(&(next_byte, next)) = chars.peek() {
+            if next == '_' || next.is_ascii_alphanumeric() {
+                end_byte = next_byte + next.len_utf8();
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let ident = &text[start_byte..end_byte];
+        if !RUST_LSP_WARMUP_KEYWORDS.contains(&ident) {
+            return Some(utf16_col_for_monospace_col(
+                text,
+                text[..start_byte].chars().count(),
+            ));
+        }
+    }
+    None
+}
+
+const RUST_LSP_WARMUP_KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
 
 struct ReviewApp {
     items: Vec<ReviewItem>,
@@ -3206,8 +3572,8 @@ impl ReviewApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let open_input = cx
-            .new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
+        let open_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo#123, PR URL, or path"));
         let palette_input = cx.new(|cx| InputState::new(window, cx));
         let tree_filter_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("filter files…"));
@@ -3327,6 +3693,16 @@ impl ReviewApp {
         char_width: Pixels,
         locked: Option<SelSide>,
     ) -> Option<(SelSide, RowCol)> {
+        let (side, row, text_x) = self.pane_text_hit(position, locked)?;
+        let col = (f32::from(text_x) / f32::from(char_width)).round().max(0.) as usize;
+        Some((side, RowCol { row, col }))
+    }
+
+    fn pane_text_hit(
+        &self,
+        position: Point<Pixels>,
+        locked: Option<SelSide>,
+    ) -> Option<(SelSide, usize, Pixels)> {
         let data = self.active_data()?;
         if data.rows.is_empty() {
             return None;
@@ -3360,8 +3736,7 @@ impl ReviewApp {
                 (side, cell_x - SPLIT_GUTTER)
             }
         };
-        let col = (text_x / f32::from(char_width)).round().max(0.) as usize;
-        Some((side, RowCol { row, col }))
+        Some((side, row, px(text_x)))
     }
 
     fn open_item(&mut self, source: Source, cx: &mut Context<Self>) {
@@ -3374,6 +3749,7 @@ impl ReviewApp {
             reloading: false,
             refresh_error: None,
             upgrade_gen: 0,
+            lsp_gen: 0,
         });
         self.active = self.items.len() - 1;
         Self::spawn_fetch(id, source, ViewMode::Split, cx);
@@ -3386,6 +3762,7 @@ impl ReviewApp {
                 .background_spawn(async move { fetch_item(&source, mode) })
                 .await;
             this.update(cx, |app, cx| {
+                let mut restart_lsp = false;
                 let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
                     return;
                 };
@@ -3393,6 +3770,7 @@ impl ReviewApp {
                 match fetched {
                     Ok(loaded) => {
                         item.install(loaded);
+                        restart_lsp = true;
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
                         // background. The bumped generation cancels any
@@ -3443,6 +3821,9 @@ impl ReviewApp {
                             _ => item.state = ItemState::Failed(msg),
                         }
                     }
+                }
+                if restart_lsp {
+                    app.restart_lsp_for_item(id, cx);
                 }
                 cx.notify();
             })
@@ -3516,6 +3897,104 @@ impl ReviewApp {
         .detach();
     }
 
+    fn restart_lsp_for_item(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
+            return;
+        };
+        let ItemState::Ready(data) = &mut item.state else {
+            return;
+        };
+        item.lsp_gen += 1;
+        let gen = item.lsp_gen;
+        data.lsp = None;
+        data.lsp_error = None;
+        data.lsp_loading = true;
+        let progress = Arc::new(Mutex::new(LspProgress {
+            title: Some("Indexing workspace".to_string()),
+            message: Some("Starting Bifrost".to_string()),
+            percentage: Some(0),
+            done: false,
+        }));
+        data.lsp_progress = Some(Arc::clone(&progress));
+        if let Some(cancel) = data.hover_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        data.hover = None;
+        data.source_view = None;
+        let source = item.source.clone();
+        let pr_meta = data.pr_meta.clone();
+        let warmup = lsp_warmup_position(data);
+        let progress_for_start = Arc::clone(&progress);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
+                    let session =
+                        LspSession::start(root.clone(), Arc::clone(&progress_for_start), warmup)?;
+                    Ok::<LspHandle, anyhow::Error>(LspHandle {
+                        root,
+                        session,
+                        progress: progress_for_start,
+                    })
+                })
+                .await;
+            this.update(cx, |app, cx| {
+                let Some(item) = app.items.iter_mut().find(|item| item.id == id) else {
+                    return;
+                };
+                if item.lsp_gen != gen {
+                    return;
+                }
+                let ItemState::Ready(data) = &mut item.state else {
+                    return;
+                };
+                data.lsp_loading = false;
+                match result {
+                    Ok(handle) => {
+                        data.lsp_progress = Some(Arc::clone(&handle.progress));
+                        data.lsp = Some(handle);
+                        data.lsp_error = None;
+                    }
+                    Err(err) => {
+                        data.lsp = None;
+                        data.lsp_error = Some(format!("{err:#}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let keep_going = this
+                .update(cx, |app, cx| {
+                    let Some(item) = app.items.iter().find(|item| item.id == id) else {
+                        return false;
+                    };
+                    if item.lsp_gen != gen {
+                        return false;
+                    }
+                    let ItemState::Ready(data) = &item.state else {
+                        return false;
+                    };
+                    if !data.lsp_loading {
+                        return false;
+                    }
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !keep_going {
+                break;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Reveal all hidden lines of one gap in an upgraded file, keeping the
     /// viewport stable: when the expansion happens above the visible top row,
     /// the scroll offset shifts down by exactly the inserted height.
@@ -3554,10 +4033,9 @@ impl ReviewApp {
             // offset.y is negative when scrolled down.
             let top_row = (f32::from(-offset.y) / ROW_HEIGHT).floor() as usize;
             if gap_row < top_row {
-                scroll.base_handle.set_offset(point(
-                    offset.x,
-                    offset.y - px(inserted as f32 * ROW_HEIGHT),
-                ));
+                scroll
+                    .base_handle
+                    .set_offset(point(offset.x, offset.y - px(inserted as f32 * ROW_HEIGHT)));
             }
         }
         cx.notify();
@@ -3647,7 +4125,10 @@ impl ReviewApp {
                 }
             }
             Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { filtered, selected, .. },
+                prs:
+                    PrListState::Loaded {
+                        filtered, selected, ..
+                    },
                 ..
             }) => {
                 if !filtered.is_empty() {
@@ -3682,7 +4163,12 @@ impl ReviewApp {
             }
             Some(PaletteStep::RepoInput { error }) => *error = None,
             Some(PaletteStep::PrList {
-                prs: PrListState::Loaded { all, filtered, selected },
+                prs:
+                    PrListState::Loaded {
+                        all,
+                        filtered,
+                        selected,
+                    },
                 ..
             }) => {
                 *filtered = filter_prs(all, &query);
@@ -4060,7 +4546,10 @@ impl ReviewApp {
     /// Jump the diff to `file_ix`'s header row and hand focus to the diff
     /// pane (like clicking a sidebar item does).
     fn jump_to_file(&mut self, file_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(&row) = self.active_data().and_then(|data| data.file_rows.get(file_ix)) else {
+        let Some(&row) = self
+            .active_data()
+            .and_then(|data| data.file_rows.get(file_ix))
+        else {
             return;
         };
         window.focus(&self.focus_handle);
@@ -4198,6 +4687,350 @@ impl ReviewApp {
         comment_anchor(&data.rows, hit.row, side).map(|_| (hit.row, side))
     }
 
+    fn symbol_target_at(
+        &mut self,
+        position: Point<Pixels>,
+        window: &Window,
+    ) -> Option<SymbolTarget> {
+        if self.palette.is_some() || self.composer.is_some() || self.review.is_some() {
+            return None;
+        }
+        let bounds = self.active_data()?.scroll.0.borrow().base_handle.bounds();
+        if !bounds.contains(&position) {
+            return None;
+        }
+        let (side, row, text_x) = self.pane_text_hit(position, None)?;
+        let text = match self.active_data()?.rows.get(row)? {
+            Row::Line { text, .. } if side == SelSide::Unified => text.as_ref(),
+            Row::SplitLine {
+                left: Some(cell), ..
+            } if side == SelSide::Left => cell.text.as_ref(),
+            Row::SplitLine {
+                right: Some(cell), ..
+            } if side == SelSide::Right => cell.text.as_ref(),
+            _ => return None,
+        };
+        let shaped = window.text_system().shape_line(
+            SharedString::from(text.to_string()),
+            px(TEXT_SIZE),
+            &[TextRun {
+                len: text.len(),
+                font: font(MONO),
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            }],
+            None,
+        );
+        let byte_col = shaped.index_for_x(text_x.max(px(0.)))?;
+        let col = text.get(..byte_col)?.chars().count();
+        self.symbol_target_for_hit(side, RowCol { row, col })
+    }
+
+    fn symbol_target_for_hit(&self, side: SelSide, hit: RowCol) -> Option<SymbolTarget> {
+        let data = self.active_data()?;
+        let file_ix = data.file_rows.iter().rposition(|&row| row <= hit.row)?;
+        let file = data.diff.files.get(file_ix)?;
+        let path = file.new_path.as_ref()?.clone();
+        let (line, text) = match data.rows.get(hit.row)? {
+            Row::Line { new_no, text, .. } if side == SelSide::Unified => {
+                ((*new_no)? - 1, text.as_ref())
+            }
+            Row::SplitLine {
+                right: Some(cell), ..
+            } if side == SelSide::Right => (cell.no - 1, cell.text.as_ref()),
+            _ => return None,
+        };
+        let col = identifier_start_at(text, hit.col)?;
+        let identifier = text
+            .chars()
+            .skip(col)
+            .take_while(|ch| *ch == '_' || ch.is_alphanumeric())
+            .collect::<String>();
+        if path.ends_with(".rs") && RUST_LSP_WARMUP_KEYWORDS.contains(&identifier.as_str()) {
+            return None;
+        }
+        let character = utf16_col_for_monospace_col(text, col);
+        Some(SymbolTarget {
+            position: LspPosition {
+                path,
+                line,
+                character,
+            },
+            row: hit.row,
+            col,
+        })
+    }
+
+    fn request_hover(
+        &mut self,
+        target: SymbolTarget,
+        mouse: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        data.hover_gen += 1;
+        let gen = data.hover_gen;
+        lsp_trace(format_args!(
+            "ui hover gen={gen} {}:{}:{} ready={}",
+            target.position.path,
+            target.position.line + 1,
+            target.position.character + 1,
+            data.lsp.is_some()
+        ));
+        if let Some(cancel) = data.hover_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        let canceled = Arc::new(AtomicBool::new(false));
+        data.hover_cancel = Some(Arc::clone(&canceled));
+        data.last_symbol_target = Some(target.clone());
+        let Some(handle) = data.lsp.clone() else {
+            if data.lsp_loading {
+                let waiting_target = target.clone();
+                data.hover = Some(HoverState {
+                    result: None,
+                    loading: true,
+                    mouse,
+                });
+                cx.notify();
+                cx.spawn(async move |this, cx| loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(150))
+                        .await;
+                    let keep_waiting = this
+                        .update(cx, |app, cx| {
+                            let Some(data) = app.active_data() else {
+                                return false;
+                            };
+                            if data.hover_gen != gen
+                                || data.last_symbol_target.as_ref() != Some(&waiting_target)
+                            {
+                                return false;
+                            }
+                            if data.lsp.is_some() {
+                                app.request_hover(waiting_target.clone(), mouse, cx);
+                                return false;
+                            }
+                            data.lsp_loading
+                        })
+                        .unwrap_or(false);
+                    if !keep_waiting {
+                        break;
+                    }
+                })
+                .detach();
+            }
+            return;
+        };
+        data.hover = None;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let should_request = this
+                .update(cx, |app, _cx| {
+                    let Some(data) = app.active_data() else {
+                        return false;
+                    };
+                    if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
+                        lsp_trace(format_args!("ui hover debounce canceled gen={gen}"));
+                        return false;
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !should_request {
+                return;
+            }
+            let position = target.position.clone();
+            let result = cx
+                .background_spawn(async move { handle.session.hover(position, canceled) })
+                .await;
+            this.update(cx, |app, cx| {
+                let Some(data) = app.active_data_mut() else {
+                    return;
+                };
+                if data.hover_gen != gen || data.last_symbol_target.as_ref() != Some(&target) {
+                    return;
+                }
+                match result {
+                    Ok(Some(result)) => {
+                        lsp_trace(format_args!("ui hover content gen={gen}"));
+                        data.hover = Some(HoverState {
+                            result: Some(result),
+                            loading: false,
+                            mouse,
+                        });
+                    }
+                    Ok(None) => {
+                        lsp_trace(format_args!("ui hover none gen={gen}"));
+                        data.hover = None;
+                    }
+                    Err(err) => {
+                        lsp_trace(format_args!("ui hover error gen={gen}: {err:#}"));
+                        data.hover = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn go_to_last_symbol(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self
+            .active_data()
+            .and_then(|data| data.last_symbol_target.clone())
+        else {
+            return;
+        };
+        self.request_definition(target, cx);
+    }
+
+    fn request_definition(&mut self, origin: SymbolTarget, cx: &mut Context<Self>) {
+        let Some(handle) = self.active_data().and_then(|data| data.lsp.clone()) else {
+            return;
+        };
+        if let Some(data) = self.active_data_mut() {
+            data.cursor = origin.row.min(data.rows.len().saturating_sub(1));
+        }
+        cx.spawn(async move |this, cx| {
+            let position = origin.position.clone();
+            let result = cx
+                .background_spawn(async move { handle.session.definition(position) })
+                .await;
+            this.update(cx, |app, cx| {
+                let target = match result {
+                    Ok(mut targets) => targets.drain(..).next(),
+                    Err(err) => {
+                        lsp_trace(format_args!("ui definition error: {err:#}"));
+                        return;
+                    }
+                };
+                let Some(target) = target else {
+                    return;
+                };
+                app.open_source_target(target, true, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_source_target(
+        &mut self,
+        target: DefinitionTarget,
+        push_history: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let lines = match self.read_lsp_source_lines(&target) {
+            Ok(lines) => lines,
+            Err(err) => {
+                lsp_trace(format_args!("ui definition source error: {err:#}"));
+                return;
+            }
+        };
+        let current = self.current_nav_location();
+        let scroll = UniformListScrollHandle::new();
+        if !lines.is_empty() {
+            scroll.scroll_to_item(
+                (target.start_line as usize).min(lines.len() - 1),
+                ScrollStrategy::Center,
+            );
+        }
+        if let Some(data) = self.active_data_mut() {
+            if push_history {
+                if let Some(current) = current {
+                    data.nav_back.push(current);
+                    data.nav_forward.clear();
+                }
+            }
+            data.source_view = Some(SourceViewState {
+                target,
+                lines,
+                scroll,
+            });
+            data.hover = None;
+            cx.notify();
+        }
+    }
+
+    fn read_lsp_source_lines(
+        &self,
+        target: &DefinitionTarget,
+    ) -> anyhow::Result<Vec<SharedString>> {
+        let data = self.active_data().context("no active item")?;
+        let handle = data.lsp.as_ref().context("LSP is not ready")?;
+        let path = handle.root.join(&target.path);
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        Ok(text
+            .lines()
+            .map(|line| SharedString::from(line.to_string()))
+            .collect())
+    }
+
+    fn current_nav_location(&self) -> Option<NavLocation> {
+        let data = self.active_data()?;
+        if let Some(source) = &data.source_view {
+            Some(NavLocation::Source {
+                target: source.target.clone(),
+            })
+        } else {
+            Some(NavLocation::Diff { row: data.cursor })
+        }
+    }
+
+    fn nav_back(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(true, cx);
+    }
+
+    fn nav_forward(&mut self, cx: &mut Context<Self>) {
+        self.navigate_history(false, cx);
+    }
+
+    fn navigate_history(&mut self, backward: bool, cx: &mut Context<Self>) {
+        let Some(current) = self.current_nav_location() else {
+            return;
+        };
+        let next = {
+            let Some(data) = self.active_data_mut() else {
+                return;
+            };
+            let stack = if backward {
+                &mut data.nav_back
+            } else {
+                &mut data.nav_forward
+            };
+            let Some(next) = stack.pop() else {
+                return;
+            };
+            if backward {
+                data.nav_forward.push(current);
+            } else {
+                data.nav_back.push(current);
+            }
+            next
+        };
+        self.restore_nav_location(next, cx);
+    }
+
+    fn restore_nav_location(&mut self, location: NavLocation, cx: &mut Context<Self>) {
+        match location {
+            NavLocation::Diff { row } => {
+                if let Some(data) = self.active_data_mut() {
+                    data.source_view = None;
+                }
+                self.jump(row, cx);
+            }
+            NavLocation::Source { target } => self.open_source_target(target, false, cx),
+        }
+    }
+
     fn open_composer(
         &mut self,
         reply_to: Option<u64>,
@@ -4229,15 +5062,12 @@ impl ReviewApp {
         // cmd-enter: the input's own `secondary-enter` binding emits
         // PressEnter { secondary: true } (after inserting a newline, which
         // submit trims away).
-        let _subscription = cx.subscribe_in(
-            &input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
+        let _subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: true }) {
                     this.submit_composer(window, cx);
                 }
-            },
-        );
+            });
         input.update(cx, |state, cx| state.focus(window, cx));
         self.composer = Some(Composer {
             item_id,
@@ -4389,15 +5219,12 @@ impl ReviewApp {
                 .auto_grow(3, 8)
                 .placeholder("leave a review comment… (optional when approving)")
         });
-        let _subscription = cx.subscribe_in(
-            &input,
-            window,
-            |this, _, event: &InputEvent, window, cx| {
+        let _subscription =
+            cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::PressEnter { secondary: true }) {
                     this.submit_review(window, cx);
                 }
-            },
-        );
+            });
         input.update(cx, |state, cx| state.focus(window, cx));
         self.review = Some(ReviewDialog {
             item_id,
@@ -4486,7 +5313,9 @@ impl ReviewApp {
     /// without reloading the whole diff.
     fn refetch_meta(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let fetched = cx.background_spawn(async move { gh::fetch_meta(&loc) }).await;
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_meta(&loc) })
+                .await;
             this.update(cx, |app, cx| {
                 let Some(item) = app.items.iter_mut().find(|item| item.id == item_id) else {
                     return;
@@ -4907,14 +5736,11 @@ impl ReviewApp {
             )
             .child(div().flex_1());
         if chat.in_flight {
-            header = header.child(
-                Button::new("chat-stop")
-                    .label("Stop")
-                    .small()
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cancel_chat(cx);
-                    })),
-            );
+            header = header.child(Button::new("chat-stop").label("Stop").small().on_click(
+                cx.listener(|this, _, _, cx| {
+                    this.cancel_chat(cx);
+                }),
+            ));
         }
 
         let mut column = div().w_full().flex().flex_col().gap_3().p_3();
@@ -4923,8 +5749,8 @@ impl ReviewApp {
                 div()
                     .text_color(theme::overlay0())
                     .child(SharedString::from(
-                        "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
-                    )),
+                    "Ask Claude about this diff. Select text in the diff to include it. ⌘⏎ sends.",
+                )),
             );
         }
         let last = chat.messages.len().saturating_sub(1);
@@ -4959,7 +5785,11 @@ impl ReviewApp {
                     }
                     let mut wrap = div().w_full().min_w_0().flex().flex_col().gap_1().child(
                         div()
-                            .text_color(if msg.error { theme::red() } else { theme::text() })
+                            .text_color(if msg.error {
+                                theme::red()
+                            } else {
+                                theme::text()
+                            })
                             .child(SharedString::from(text)),
                     );
                     if let Some(cost) = msg.cost {
@@ -5001,7 +5831,12 @@ impl ReviewApp {
         let sel_hint = data
             .selection
             .and_then(|sel| selection_info(&sel, &data.rows, &data.file_rows, &data.diff))
-            .map(|info| format!("will include selection {}:{}-{}", info.path, info.lo, info.hi));
+            .map(|info| {
+                format!(
+                    "will include selection {}:{}-{}",
+                    info.path, info.lo, info.hi
+                )
+            });
         let mut input_area = div()
             .p_2()
             .flex_shrink_0()
@@ -5064,7 +5899,10 @@ impl ReviewApp {
             return None;
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
-        let file_ix = data.file_rows.iter().rposition(|&header| header <= row_ix)?;
+        let file_ix = data
+            .file_rows
+            .iter()
+            .rposition(|&header| header <= row_ix)?;
         let path = data.diff.files[file_ix].display_path().to_string();
         let (bounds, offset) = {
             let state = data.scroll.0.borrow();
@@ -5098,16 +5936,13 @@ impl ReviewApp {
                 .text_size(px(13.))
                 .cursor_pointer()
                 .child(SharedString::from("+"))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    move |_, window, cx| {
-                        cx.stop_propagation();
-                        let path = path.clone();
-                        entity.update(cx, |this, cx| {
-                            this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
-                        });
-                    },
-                )
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    let path = path.clone();
+                    entity.update(cx, |this, cx| {
+                        this.open_composer(None, path, anchor_side, line, row_ix, window, cx);
+                    });
+                })
                 .into_any_element(),
         )
     }
@@ -5134,8 +5969,7 @@ impl ReviewApp {
         let pane_h = f32::from(bounds.size.height);
         let row_y = composer.row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
         let y = f32::from(bounds.top()) + (row_y + ROW_HEIGHT).clamp(8., (pane_h - 250.).max(8.));
-        let x = (f32::from(bounds.left()) + 72.)
-            .min((f32::from(bounds.right()) - 528.).max(8.));
+        let x = (f32::from(bounds.left()) + 72.).min((f32::from(bounds.right()) - 528.).max(8.));
         let action = if composer.reply_to.is_some() {
             "Reply"
         } else {
@@ -5143,7 +5977,11 @@ impl ReviewApp {
         };
         let target = format!(
             "{}{}:{} ({})",
-            if composer.reply_to.is_some() { "reply · " } else { "" },
+            if composer.reply_to.is_some() {
+                "reply · "
+            } else {
+                ""
+            },
             composer.path,
             composer.line,
             composer.side.api_str()
@@ -5230,34 +6068,35 @@ impl ReviewApp {
             return empty();
         }
         let selected = review.verdict;
-        let verdict_option = |label: &'static str, verdict: gh::ReviewVerdict, color: gpui::Rgba| {
-            let tint: Hsla = color.into();
-            div()
-                .id(label)
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .border_1()
-                .cursor_pointer()
-                .when(verdict == selected, |opt| {
-                    opt.bg(tint.opacity(0.15))
-                        .border_color(tint.opacity(0.6))
-                        .text_color(color)
-                })
-                .when(verdict != selected, |opt| {
-                    opt.border_color(theme::surface0())
-                        .text_color(theme::subtext())
-                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
-                })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(review) = &mut this.review {
-                        review.verdict = verdict;
-                        review.error = None;
-                        cx.notify();
-                    }
-                }))
-                .child(SharedString::from(label))
-        };
+        let verdict_option =
+            |label: &'static str, verdict: gh::ReviewVerdict, color: gpui::Rgba| {
+                let tint: Hsla = color.into();
+                div()
+                    .id(label)
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .cursor_pointer()
+                    .when(verdict == selected, |opt| {
+                        opt.bg(tint.opacity(0.15))
+                            .border_color(tint.opacity(0.6))
+                            .text_color(color)
+                    })
+                    .when(verdict != selected, |opt| {
+                        opt.border_color(theme::surface0())
+                            .text_color(theme::subtext())
+                            .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(review) = &mut this.review {
+                            review.verdict = verdict;
+                            review.error = None;
+                            cx.notify();
+                        }
+                    }))
+                    .child(SharedString::from(label))
+            };
         let submit_label = match selected {
             gh::ReviewVerdict::Approve => "Approve",
             gh::ReviewVerdict::RequestChanges => "Request changes",
@@ -5308,13 +6147,21 @@ impl ReviewApp {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(verdict_option("approve", gh::ReviewVerdict::Approve, theme::green()))
+                            .child(verdict_option(
+                                "approve",
+                                gh::ReviewVerdict::Approve,
+                                theme::green(),
+                            ))
                             .child(verdict_option(
                                 "request changes",
                                 gh::ReviewVerdict::RequestChanges,
                                 theme::red(),
                             ))
-                            .child(verdict_option("comment", gh::ReviewVerdict::Comment, theme::blue())),
+                            .child(verdict_option(
+                                "comment",
+                                gh::ReviewVerdict::Comment,
+                                theme::blue(),
+                            )),
                     )
                     .child(Input::new(&review.input))
                     .when_some(review.error.clone(), |card, err| {
@@ -5428,8 +6275,7 @@ impl ReviewApp {
                             ));
                         }
                         // Viewport indicator — the only per-frame math.
-                        let offset_y =
-                            f32::from(-data.scroll.0.borrow().base_handle.offset().y);
+                        let offset_y = f32::from(-data.scroll.0.borrow().base_handle.offset().y);
                         let px_per_row = layout.slot_h / layout.group as f32;
                         let top_row = offset_y / ROW_HEIGHT;
                         let visible = (pane_h / ROW_HEIGHT).min(total as f32 - top_row);
@@ -5480,6 +6326,7 @@ impl ReviewApp {
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
+            .when_some(self.render_lsp_status(), |bar, status| bar.child(status))
             .when_some(note, |bar, note| {
                 bar.child(
                     div()
@@ -5626,9 +6473,7 @@ impl ReviewApp {
             let scroll = data.scroll.0.borrow();
             let top_row = match &scroll.deferred_scroll_to_item {
                 Some(deferred) => deferred.item_index,
-                None => {
-                    (f32::from(-scroll.base_handle.offset().y) / ROW_HEIGHT).max(0.) as usize
-                }
+                None => (f32::from(-scroll.base_handle.offset().y) / ROW_HEIGHT).max(0.) as usize,
             };
             drop(scroll);
             current_file = data.file_rows.iter().rposition(|&ix| ix <= top_row);
@@ -5701,12 +6546,7 @@ impl ReviewApp {
                     .gap_1()
                     .child(Input::new(&self.open_input).small())
                     .when_some(self.open_error.clone(), |area, err| {
-                        area.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme::red())
-                                .child(err),
-                        )
+                        area.child(div().text_size(px(11.)).text_color(theme::red()).child(err))
                     }),
             )
             .child(list)
@@ -5726,7 +6566,11 @@ impl ReviewApp {
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }))
-                    .child(div().p_2().child(Input::new(&self.tree_filter_input).small()))
+                    .child(
+                        div()
+                            .p_2()
+                            .child(Input::new(&self.tree_filter_input).small()),
+                    )
                     .child(div().flex_1().min_h_0().child(tree_list)),
             )
     }
@@ -5831,7 +6675,12 @@ impl ReviewApp {
                             uniform_list("palette-prs", count, move |range, _window, cx| {
                                 let this = entity.read(cx);
                                 let Some(PaletteStep::PrList {
-                                    prs: PrListState::Loaded { all, filtered, selected },
+                                    prs:
+                                        PrListState::Loaded {
+                                            all,
+                                            filtered,
+                                            selected,
+                                        },
                                     ..
                                 }) = &this.palette
                                 else {
@@ -5973,19 +6822,15 @@ impl ReviewApp {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_action(cx.listener(|this, _: &PaletteUp, _, cx| this.palette_move(-1, cx)))
                     .on_action(cx.listener(|this, _: &PaletteDown, _, cx| this.palette_move(1, cx)))
-                    .on_action(
-                        cx.listener(|this, _: &PaletteBack, window, cx| {
-                            this.palette_back(window, cx)
-                        }),
-                    )
+                    .on_action(cx.listener(|this, _: &PaletteBack, window, cx| {
+                        this.palette_back(window, cx)
+                    }))
                     // The palette input propagates Escape when it has nothing
                     // of its own to dismiss; intercept it here before the
                     // root's handler steals focus back to the diff.
-                    .on_action(
-                        cx.listener(|this, _: &InputEscape, window, cx| {
-                            this.palette_back(window, cx)
-                        }),
-                    )
+                    .on_action(cx.listener(|this, _: &InputEscape, window, cx| {
+                        this.palette_back(window, cx)
+                    }))
                     .w(px(560.))
                     .rounded_lg()
                     .border_1()
@@ -6014,6 +6859,188 @@ impl ReviewApp {
                             .child(Input::new(&self.palette_input).small()),
                     )
                     .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn render_lsp_status(&self) -> Option<gpui::AnyElement> {
+        let data = self.active_data()?;
+        let (text, color) = if let Some(err) = &data.lsp_error {
+            (
+                SharedString::from(format!("LSP: error - {err}")),
+                theme::red(),
+            )
+        } else if data.lsp_progress.is_some() {
+            let progress = data
+                .lsp_progress
+                .as_ref()
+                .and_then(|progress| progress.lock().ok().map(|progress| progress.clone()))
+                .unwrap_or_default();
+            let percentage = progress.percentage.unwrap_or(0);
+            (
+                SharedString::from(format!("LSP: {percentage}%")),
+                theme::blue(),
+            )
+        } else if data.lsp_loading {
+            (SharedString::from("LSP: 0%"), theme::blue())
+        } else {
+            return None;
+        };
+        Some(
+            div()
+                .flex_shrink_0()
+                .px_2()
+                .rounded_sm()
+                .border_1()
+                .border_color(Hsla::from(color).opacity(0.45))
+                .bg(Hsla::from(color).opacity(0.1))
+                .text_size(px(11.))
+                .text_color(color)
+                .child(text)
+                .into_any_element(),
+        )
+    }
+
+    fn render_hover(&self) -> Option<gpui::AnyElement> {
+        let data = self.active_data()?;
+        let hover = data.hover.as_ref()?;
+        let definition_hint = if cfg!(target_os = "macos") {
+            "Cmd+click to go to definition"
+        } else {
+            "Ctrl+click to go to definition"
+        };
+        let text = if hover.loading {
+            let percentage = data
+                .lsp_progress
+                .as_ref()
+                .and_then(|progress| progress.lock().ok()?.percentage)
+                .unwrap_or(0);
+            SharedString::from(format!("LSP: {percentage}%"))
+        } else {
+            SharedString::from(hover.result.as_ref()?.text.clone())
+        };
+        Some(
+            div()
+                .absolute()
+                .left(hover.mouse.x + px(14.))
+                .top(hover.mouse.y + px(18.))
+                .max_w(px(520.))
+                .max_h(px(260.))
+                .overflow_hidden()
+                .rounded_sm()
+                .border_1()
+                .border_color(theme::surface0())
+                .bg(theme::mantle())
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .font_family(MONO)
+                .text_size(px(12.))
+                .line_height(px(18.))
+                .text_color(theme::text())
+                .child(div().p_3().child(text))
+                .child(
+                    div()
+                        .border_t_1()
+                        .border_color(theme::surface0())
+                        .px_3()
+                        .py_1()
+                        .text_size(px(10.))
+                        .text_color(theme::overlay0())
+                        .child(definition_hint),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_source_view(
+        &self,
+        source: &SourceViewState,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let lines = source.lines.clone();
+        let target = source.target.clone();
+        let can_back = self
+            .active_data()
+            .is_some_and(|data| !data.nav_back.is_empty());
+        let can_forward = self
+            .active_data()
+            .is_some_and(|data| !data.nav_forward.is_empty());
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(MONO)
+            .text_size(px(TEXT_SIZE))
+            .line_height(px(ROW_HEIGHT))
+            .child(
+                div()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .px_3()
+                    .flex()
+                    .items_center()
+                    .bg(theme::mantle())
+                    .border_b_1()
+                    .border_color(theme::surface0())
+                    .text_color(theme::subtext())
+                    .gap_1()
+                    .child(
+                        Button::new("source-nav-back")
+                            .icon(IconName::ArrowLeft)
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_back)
+                            .tooltip_with_action("Back", &NavBack, Some("ReviewApp"))
+                            .on_click(cx.listener(|this, _, _, cx| this.nav_back(cx))),
+                    )
+                    .child(
+                        Button::new("source-nav-forward")
+                            .icon(IconName::ArrowRight)
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_forward)
+                            .tooltip_with_action("Forward", &NavForward, Some("ReviewApp"))
+                            .on_click(cx.listener(|this, _, _, cx| this.nav_forward(cx))),
+                    )
+                    .child(div().min_w_0().truncate().child(SharedString::from(format!(
+                        "{}:{}",
+                        target.path,
+                        target.start_line + 1
+                    )))),
+            )
+            .child(
+                uniform_list("source", lines.len(), move |range, _window, _cx| {
+                    range
+                        .map(|ix| {
+                            let mut row = div().h(px(ROW_HEIGHT)).flex().items_center();
+                            if ix as u32 == target.start_line {
+                                row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
+                            }
+                            row.child(
+                                div()
+                                    .w(px(64.))
+                                    .flex_shrink_0()
+                                    .pr_2()
+                                    .text_color(theme::overlay0())
+                                    .flex()
+                                    .justify_end()
+                                    .child(SharedString::from((ix + 1).to_string())),
+                            )
+                            .child(
+                                div()
+                                    .whitespace_nowrap()
+                                    .text_color(theme::text())
+                                    .child(lines[ix].clone()),
+                            )
+                            .into_any_element()
+                        })
+                        .collect()
+                })
+                .track_scroll(source.scroll.clone())
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .flex_1()
+                .min_h_0(),
             )
             .into_any_element()
     }
@@ -6077,6 +7104,9 @@ impl Render for ReviewApp {
                             .child(SharedString::from(msg.clone())),
                     )
                     .into_any_element(),
+                ItemState::Ready(data) if data.source_view.is_some() => {
+                    self.render_source_view(data.source_view.as_ref().unwrap(), cx)
+                }
                 ItemState::Ready(data) => div()
                     .size_full()
                     .relative()
@@ -6095,6 +7125,13 @@ impl Render for ReviewApp {
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
                             if this.palette.is_some() {
                                 return;
+                            }
+                            if event.modifiers.secondary() {
+                                if let Some(target) = this.symbol_target_at(event.position, window)
+                                {
+                                    this.request_definition(target, cx);
+                                    return;
+                                }
                             }
                             window.focus(&this.focus_handle);
                             let char_width = this.char_width(window);
@@ -6127,7 +7164,8 @@ impl Render for ReviewApp {
                         else {
                             return;
                         };
-                        let selection = (head != anchor).then_some(Selection { side, anchor, head });
+                        let selection =
+                            (head != anchor).then_some(Selection { side, anchor, head });
                         if let Some(data) = this.active_data_mut() {
                             if data.selection != selection {
                                 data.selection = selection;
@@ -6191,6 +7229,7 @@ impl Render for ReviewApp {
                     // Hover "+" (add comment) overlay, absolutely positioned
                     // at the hovered row's y like the minimap viewport.
                     .children(self.render_plus(cx))
+                    .when_some(self.render_hover(), |pane, hover| pane.child(hover))
                     .into_any_element(),
             },
         };
@@ -6209,19 +7248,31 @@ impl Render for ReviewApp {
                 }
             }))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| {
-                let targets = this.active_data().map(|d| d.file_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.file_rows.clone())
+                    .unwrap_or_default();
                 this.jump_next(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| {
-                let targets = this.active_data().map(|d| d.file_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.file_rows.clone())
+                    .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
-                let targets = this.active_data().map(|d| d.hunk_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.hunk_rows.clone())
+                    .unwrap_or_default();
                 this.jump_next(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
-                let targets = this.active_data().map(|d| d.hunk_rows.clone()).unwrap_or_default();
+                let targets = this
+                    .active_data()
+                    .map(|d| d.hunk_rows.clone())
+                    .unwrap_or_default();
                 this.jump_prev(&targets, cx)
             }))
             .on_action(cx.listener(|this, _: &GoToTop, _, cx| this.jump(0, cx)))
@@ -6245,9 +7296,10 @@ impl Render for ReviewApp {
                     this.open_review(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| {
-                this.toggle_chat(window, cx)
-            }))
+            .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.toggle_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &GoToDefinition, _, cx| this.go_to_last_symbol(cx)))
+            .on_action(cx.listener(|this, _: &NavBack, _, cx| this.nav_back(cx)))
+            .on_action(cx.listener(|this, _: &NavForward, _, cx| this.nav_forward(cx)))
             // Hover tracking for the "+" affordance lives on the root so the
             // affordance clears when the pointer leaves the diff list.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
@@ -6258,6 +7310,27 @@ impl Render for ReviewApp {
                 if this.hover_plus != hover {
                     this.hover_plus = hover;
                     cx.notify();
+                }
+                let symbol = this.symbol_target_at(event.position, window);
+                let existing = this
+                    .active_data()
+                    .and_then(|data| data.last_symbol_target.clone());
+                match (symbol, existing) {
+                    (Some(target), Some(existing)) if target == existing => {}
+                    (Some(target), _) => this.request_hover(target, event.position, cx),
+                    (None, Some(_)) => {
+                        if let Some(data) = this.active_data_mut() {
+                            data.hover_gen += 1;
+                            lsp_trace(format_args!("ui hover cleared gen={}", data.hover_gen));
+                            if let Some(cancel) = data.hover_cancel.take() {
+                                cancel.store(true, Ordering::Release);
+                            }
+                            data.last_symbol_target = None;
+                            data.hover = None;
+                            cx.notify();
+                        }
+                    }
+                    (None, None) => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &Refresh, _, cx| this.refresh(cx)))
@@ -6274,6 +7347,16 @@ impl Render for ReviewApp {
                 // Next in line: a streaming chat run — escape stops it.
                 if this.cancel_chat(cx) {
                     return;
+                }
+                if let Some(data) = this.active_data_mut() {
+                    if data.hover.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
+                    if data.source_view.take().is_some() {
+                        cx.notify();
+                        return;
+                    }
                 }
                 if let Some(data) = this.active_data_mut() {
                     if data.selection.take().is_some() {
@@ -6369,6 +7452,18 @@ impl Render for ReviewApp {
 mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
+
+    #[test]
+    fn identifier_hover_hit_snaps_to_the_token_start() {
+        let text = "    if cfg.font.mono_family.is_empty() {";
+        assert_eq!(identifier_start_at(text, 7), Some(7));
+        assert_eq!(identifier_start_at(text, 9), Some(7));
+        assert_eq!(identifier_start_at(text, 10), Some(7));
+        assert_eq!(identifier_start_at(text, 11), Some(11));
+        assert_eq!(identifier_start_at(text, 14), Some(11));
+        assert_eq!(identifier_start_at(text, 15), Some(11));
+        assert_eq!(identifier_start_at(text, 6), None);
+    }
 
     fn ctx(old_no: u32, new_no: u32, text: &str) -> DiffRow {
         DiffRow::Context {
@@ -6501,7 +7596,8 @@ mod tests {
 
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
-        let (rows, _, hunk_rows) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let (rows, _, hunk_rows) =
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
         let h2 = hunk_rows[1];
         // 2 removed / 1 added: first row paired, second left-only.
         match &rows[h2 + 1] {
@@ -6595,7 +7691,11 @@ mod tests {
             let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true);
             // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
             match &rows[1] {
-                Row::Gap { file_ix, gap_ix, hidden } => {
+                Row::Gap {
+                    file_ix,
+                    gap_ix,
+                    hidden,
+                } => {
                     assert_eq!((*file_ix, *gap_ix, *hidden), (0, 0, 6));
                 }
                 other => panic!("expected leading gap, got {}", row_name(other)),
@@ -6613,7 +7713,13 @@ mod tests {
         // Un-upgraded build of the same diff has no gap rows.
         let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
-        assert!(matches!(rows[1], Row::HunkHeader { upgraded: false, .. }));
+        assert!(matches!(
+            rows[1],
+            Row::HunkHeader {
+                upgraded: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -6626,7 +7732,13 @@ mod tests {
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
             match row {
-                Row::Line { old_no, new_no, kind, text, .. } => {
+                Row::Line {
+                    old_no,
+                    new_no,
+                    kind,
+                    text,
+                    ..
+                } => {
                     assert_eq!(*kind, LineKind::Context);
                     assert_eq!(*old_no, Some(j as u32 + 1));
                     assert_eq!(*new_no, Some(j as u32 + 1));
@@ -6656,7 +7768,12 @@ mod tests {
         let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
-            Row::Line { old_no, new_no, text, .. } => {
+            Row::Line {
+                old_no,
+                new_no,
+                text,
+                ..
+            } => {
                 assert_eq!((*old_no, *new_no), (Some(20), Some(20)));
                 assert_eq!(text.as_ref(), "line 20");
             }
@@ -6681,7 +7798,10 @@ mod tests {
         let syntax = [(0..2, Token::Keyword), (3..7, Token::Function)];
         assert_eq!(
             merge_highlights(&syntax, &[], None, None),
-            vec![(0..2, style(Token::Keyword)), (3..7, style(Token::Function))]
+            vec![
+                (0..2, style(Token::Keyword)),
+                (3..7, style(Token::Function))
+            ]
         );
     }
 
@@ -6989,7 +8109,10 @@ mod tests {
         // Unified emits one row per diff row; split collapses the equal run.
         let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
         let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true);
-        let unified_lines = unified.iter().filter(|r| matches!(r, Row::Line { .. })).count();
+        let unified_lines = unified
+            .iter()
+            .filter(|r| matches!(r, Row::Line { .. }))
+            .count();
         let split_lines = split
             .iter()
             .filter(|r| matches!(r, Row::SplitLine { .. }))
@@ -7026,8 +8149,14 @@ mod tests {
     fn sel(side: SelSide, anchor: (usize, usize), head: (usize, usize)) -> Selection {
         Selection {
             side,
-            anchor: RowCol { row: anchor.0, col: anchor.1 },
-            head: RowCol { row: head.0, col: head.1 },
+            anchor: RowCol {
+                row: anchor.0,
+                col: anchor.1,
+            },
+            head: RowCol {
+                row: head.0,
+                col: head.1,
+            },
         }
     }
 
@@ -7049,7 +8178,10 @@ mod tests {
         assert_eq!(char_to_byte(text, 10), 10); // 'é'
         assert_eq!(char_to_byte(text, 11), 12); // first 'l': 'é' is 2 bytes
         assert_eq!(char_to_byte(text, 99), text.len()); // clamped
-        assert_eq!(&text[char_to_byte(text, 8)..char_to_byte(text, 14)], "\"héllo");
+        assert_eq!(
+            &text[char_to_byte(text, 8)..char_to_byte(text, 14)],
+            "\"héllo"
+        );
     }
 
     #[test]
@@ -7068,13 +8200,19 @@ mod tests {
 
     #[test]
     fn row_range_skips_non_text_rows() {
-        let header = Row::HunkHeader { label: "@@".into(), upgraded: false };
+        let header = Row::HunkHeader {
+            label: "@@".into(),
+            upgraded: false,
+        };
         let sel = sel(SelSide::Unified, (0, 0), (2, 3));
         // Headers/spacers inside the span contribute nothing…
         assert_eq!(row_selection_range(&sel, 1, &header), None);
         assert_eq!(row_selection_range(&sel, 1, &Row::Spacer), None);
         // …and split rows never match a Unified-side selection.
-        assert_eq!(row_selection_range(&sel, 1, &split(Some("x"), Some("y"))), None);
+        assert_eq!(
+            row_selection_range(&sel, 1, &split(Some("x"), Some("y"))),
+            None
+        );
     }
 
     #[test]
@@ -7107,7 +8245,10 @@ mod tests {
     fn copy_assembles_contributing_rows() {
         let rows = vec![
             line("fn main() {"),
-            Row::HunkHeader { label: "@@".into(), upgraded: false },
+            Row::HunkHeader {
+                label: "@@".into(),
+                upgraded: false,
+            },
             line(""),
             line("    body();"),
             line("}"),
@@ -7115,7 +8256,10 @@ mod tests {
         // From col 3 of row 0 through col 1 of row 4: the header is skipped
         // (no blank line for it), the empty line survives as an empty line.
         let forward = sel(SelSide::Unified, (0, 3), (4, 1));
-        assert_eq!(selection_text(&forward, &rows), "main() {\n\n    body();\n}");
+        assert_eq!(
+            selection_text(&forward, &rows),
+            "main() {\n\n    body();\n}"
+        );
         // Backward drag over one row.
         let backward = sel(SelSide::Unified, (0, 7), (0, 3));
         assert_eq!(selection_text(&backward, &rows), "main");
@@ -7149,7 +8293,13 @@ mod tests {
 
     #[test]
     fn minimap_rows_unified_kinds_and_fracs() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // FileHeader and HunkHeader both map to Header ticks.
@@ -7159,7 +8309,7 @@ mod tests {
         assert_eq!(mm[2], mrow(MinimapKind::Context, 3. / 160.)); // "ctx"
         assert_eq!(mm[3], mrow(MinimapKind::Removed, 4. / 160.)); // "old1"
         assert_eq!(mm[5], mrow(MinimapKind::Added, 4. / 160.)); // "new1"
-        // Spacer and Binary rows are blank.
+                                                                // Spacer and Binary rows are blank.
         assert_eq!(mm[14], mrow(MinimapKind::Blank, 0.));
         assert_eq!(mm[16], mrow(MinimapKind::Blank, 0.));
     }
@@ -7331,7 +8481,12 @@ mod tests {
     fn minimap_split_rows_use_half_lanes() {
         let pair = |left_frac: f32, right_frac: f32, left: bool, right: bool| {
             mrow(
-                MinimapKind::SplitPair { left_frac, right_frac, left, right },
+                MinimapKind::SplitPair {
+                    left_frac,
+                    right_frac,
+                    left,
+                    right,
+                },
                 left_frac.max(right_frac),
             )
         };
@@ -7445,19 +8600,91 @@ mod tests {
     fn group_comments_threads_replies_orphans_and_outdated() {
         let index = group_comments(vec![
             // Deliberately out of order: grouping sorts by created_at.
-            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
-            rc(1, "a.rs", Some("RIGHT"), Some(2), "root", "alice", "2026-01-01T00:00:00Z", None),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "root",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
             // Second thread at the same anchor, created later.
-            rc(3, "a.rs", Some("RIGHT"), Some(2), "later", "carol", "2026-01-03T00:00:00Z", None),
+            rc(
+                3,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "later",
+                "carol",
+                "2026-01-03T00:00:00Z",
+                None,
+            ),
             // LEFT-side thread on the same line number: distinct anchor.
-            rc(4, "a.rs", Some("LEFT"), Some(2), "old side", "dave", "2026-01-04T00:00:00Z", None),
+            rc(
+                4,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "old side",
+                "dave",
+                "2026-01-04T00:00:00Z",
+                None,
+            ),
             // Outdated: no current line. Counts, never anchors.
-            rc(5, "a.rs", None, None, "stale", "erin", "2026-01-05T00:00:00Z", None),
+            rc(
+                5,
+                "a.rs",
+                None,
+                None,
+                "stale",
+                "erin",
+                "2026-01-05T00:00:00Z",
+                None,
+            ),
             // Orphaned reply: parent never fetched — dropped entirely.
-            rc(6, "a.rs", Some("RIGHT"), Some(2), "orphan", "mallory", "2026-01-06T00:00:00Z", Some(999)),
+            rc(
+                6,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "orphan",
+                "mallory",
+                "2026-01-06T00:00:00Z",
+                Some(999),
+            ),
             // Reply-to-a-reply lands in the root's thread.
-            rc(7, "a.rs", Some("RIGHT"), Some(2), "nested", "alice", "2026-01-07T00:00:00Z", Some(2)),
-            rc(8, "b.rs", Some("RIGHT"), Some(9), "other file", "bob", "2026-01-08T00:00:00Z", None),
+            rc(
+                7,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "nested",
+                "alice",
+                "2026-01-07T00:00:00Z",
+                Some(2),
+            ),
+            rc(
+                8,
+                "b.rs",
+                Some("RIGHT"),
+                Some(9),
+                "other file",
+                "bob",
+                "2026-01-08T00:00:00Z",
+                None,
+            ),
         ]);
         let a = &index.threads["a.rs"];
         let right = &a[&(CommentSide::Right, 2)];
@@ -7482,18 +8709,59 @@ mod tests {
     /// one outdated comment.
     fn sample_comments() -> CommentIndex {
         group_comments(vec![
-            rc(1, "a.rs", Some("RIGHT"), Some(2), "on new1", "alice", "2026-01-01T00:00:00Z", None),
-            rc(2, "a.rs", Some("RIGHT"), Some(2), "reply", "bob", "2026-01-02T00:00:00Z", Some(1)),
-            rc(3, "a.rs", Some("LEFT"), Some(2), "on old1", "carol", "2026-01-03T00:00:00Z", None),
-            rc(4, "a.rs", None, None, "outdated", "dave", "2026-01-04T00:00:00Z", None),
+            rc(
+                1,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "on new1",
+                "alice",
+                "2026-01-01T00:00:00Z",
+                None,
+            ),
+            rc(
+                2,
+                "a.rs",
+                Some("RIGHT"),
+                Some(2),
+                "reply",
+                "bob",
+                "2026-01-02T00:00:00Z",
+                Some(1),
+            ),
+            rc(
+                3,
+                "a.rs",
+                Some("LEFT"),
+                Some(2),
+                "on old1",
+                "carol",
+                "2026-01-03T00:00:00Z",
+                None,
+            ),
+            rc(
+                4,
+                "a.rs",
+                None,
+                None,
+                "outdated",
+                "dave",
+                "2026-01-04T00:00:00Z",
+                None,
+            ),
         ])
     }
 
     #[test]
     fn unified_rows_insert_threads_beneath_their_anchor() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
         // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
         let names: Vec<&str> = rows.iter().map(row_name).collect();
@@ -7502,30 +8770,34 @@ mod tests {
             &[
                 "FileHeader",
                 "HunkHeader",
-                "Line",           // ctx 1/1
-                "Line",           // rem old1 (old 2)
-                "CommentHeader",  // carol on old1
+                "Line",          // ctx 1/1
+                "Line",          // rem old1 (old 2)
+                "CommentHeader", // carol on old1
                 "CommentBody",
                 "CommentActions",
-                "Line",           // rem old2
-                "Line",           // add new1 (new 2)
-                "CommentHeader",  // alice
+                "Line",          // rem old2
+                "Line",          // add new1 (new 2)
+                "CommentHeader", // alice
                 "CommentBody",
-                "CommentHeader",  // bob's reply
+                "CommentHeader", // bob's reply
             ]
         );
         assert_eq!(names[12], "CommentBody");
         assert_eq!(names[13], "CommentActions");
         // The LEFT thread is carol's; the reply flag follows position.
         match &rows[4] {
-            Row::CommentHeader { author, is_reply, .. } => {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
                 assert_eq!(author.as_ref(), "carol");
                 assert!(!is_reply);
             }
             other => panic!("expected comment header, got {}", row_name(other)),
         }
         match &rows[11] {
-            Row::CommentHeader { author, is_reply, .. } => {
+            Row::CommentHeader {
+                author, is_reply, ..
+            } => {
                 assert_eq!(author.as_ref(), "bob");
                 assert!(is_reply);
             }
@@ -7533,7 +8805,12 @@ mod tests {
         }
         // Actions row targets the thread root and carries the anchor.
         match &rows[13] {
-            Row::CommentActions { root_id, path, side, line } => {
+            Row::CommentActions {
+                root_id,
+                path,
+                side,
+                line,
+            } => {
                 assert_eq!(*root_id, 1);
                 assert_eq!(path.as_ref(), "a.rs");
                 assert_eq!((*side, *line), (CommentSide::Right, 2));
@@ -7542,7 +8819,9 @@ mod tests {
         }
         // File header carries the counts (3 anchored, 1 outdated).
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (3, 1));
             }
             other => panic!("expected file header, got {}", row_name(other)),
@@ -7555,22 +8834,27 @@ mod tests {
     #[test]
     fn split_rows_anchor_threads_by_cell() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
         let names: Vec<&str> = rows.iter().map(row_name).collect();
         assert_eq!(
             &names[2..11],
             &[
-                "SplitLine",      // ctx
-                "SplitLine",      // old1 | new1
-                "CommentHeader",  // carol (LEFT)
+                "SplitLine",     // ctx
+                "SplitLine",     // old1 | new1
+                "CommentHeader", // carol (LEFT)
                 "CommentBody",
                 "CommentActions",
-                "CommentHeader",  // alice (RIGHT)
+                "CommentHeader", // alice (RIGHT)
                 "CommentBody",
-                "CommentHeader",  // bob reply
+                "CommentHeader", // bob reply
                 "CommentBody",
             ]
         );
@@ -7581,21 +8865,35 @@ mod tests {
     #[test]
     fn hidden_comments_keep_header_counts() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), false);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            false,
+        );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (3, 1));
             }
             other => panic!("expected file header, got {}", row_name(other)),
         }
         // And with no index at all (local items): zero counts, no rows.
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
-            Row::FileHeader { comments, outdated, .. } => {
+            Row::FileHeader {
+                comments, outdated, ..
+            } => {
                 assert_eq!((*comments, *outdated), (0, 0));
             }
             other => panic!("expected file header, got {}", row_name(other)),
@@ -7607,16 +8905,20 @@ mod tests {
         let (diff, mut upgrades) = upgraded_diff();
         // a.txt line 3 lives in the leading gap (hunk covers 7..=13).
         let index = group_comments(vec![rc(
-            9, "a.txt", Some("RIGHT"), Some(3), "gap comment", "alice",
-            "2026-01-01T00:00:00Z", None,
+            9,
+            "a.txt",
+            Some("RIGHT"),
+            Some(3),
+            "gap comment",
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
         )]);
-        let (rows, _, _) =
-            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
         // Collapsed gap: the thread has no anchor row and stays hidden.
         assert!(!rows.iter().any(is_comment_row));
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
-        let (rows, _, _) =
-            build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
         // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
         assert_eq!(row_name(&rows[3]), "Line");
         assert_eq!(row_name(&rows[4]), "CommentHeader");
@@ -7627,8 +8929,13 @@ mod tests {
     #[test]
     fn comment_anchor_resolves_sides_and_skips_non_lines() {
         let index = sample_comments();
-        let (rows, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
         assert_eq!(comment_anchor(&rows, 4, SelSide::Unified), None);
@@ -7668,10 +8975,20 @@ mod tests {
     #[test]
     fn nth_noncomment_row_maps_positions_across_comment_insertions() {
         let index = sample_comments();
-        let (plain, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
-        let (with, _, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), Some(&index), true);
+        let (plain, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
+        let (with, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+        );
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {
             let ix = nth_noncomment_row(&with, n);
@@ -7720,7 +9037,9 @@ mod tests {
         let meta = gh::PrMeta {
             number: 7,
             title: "Fix the frobnicator".into(),
-            author: gh::Author { login: "alice".into() },
+            author: gh::Author {
+                login: "alice".into(),
+            },
             state: "OPEN".into(),
             url: "https://github.com/o/r/pull/7".into(),
             body: "It was broken.\n".into(),
@@ -7741,7 +9060,10 @@ mod tests {
         assert!(header.contains("main ← fix"));
         assert!(header.contains("It was broken."));
         // Empty body → explicit placeholder, so the model doesn't guess.
-        let meta = gh::PrMeta { body: "  \n".into(), ..meta };
+        let meta = gh::PrMeta {
+            body: "  \n".into(),
+            ..meta
+        };
         assert!(pr_chat_header(&meta).contains("(no description)"));
 
         let src = git::LocalSource {
@@ -7759,8 +9081,13 @@ mod tests {
 
     #[test]
     fn selection_info_resolves_anchor_and_text() {
-        let (rows, file_rows, _) =
-            build_rows(&sample_diff(), ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, file_rows, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            None,
+            true,
+        );
         // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
         // rem(3 "old2"), add(2 "new1"), …
         let unified = sel(SelSide::Unified, (2, 0), (5, 4));
@@ -7784,7 +9111,10 @@ mod tests {
 
         // A selection with no text (headers only) yields nothing.
         let empty = sel(SelSide::Unified, (0, 0), (0, 5));
-        assert_eq!(selection_info(&empty, &rows, &file_rows, &sample_diff()), None);
+        assert_eq!(
+            selection_info(&empty, &rows, &file_rows, &sample_diff()),
+            None
+        );
     }
 
     #[test]

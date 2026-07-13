@@ -486,8 +486,9 @@ fn word_diff(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
     );
 
     let changed = |ranges: &[Range<usize>], len: usize| {
-        len > 0 && ranges.iter().map(|r| r.len()).sum::<usize>() as f32 / len as f32
-            > MAX_CHANGED_FRACTION
+        len > 0
+            && ranges.iter().map(|r| r.len()).sum::<usize>() as f32 / len as f32
+                > MAX_CHANGED_FRACTION
     };
     if changed(&old_ranges, old.trim_end().len()) || changed(&new_ranges, new.trim_end().len()) {
         return (Vec::new(), Vec::new());
@@ -623,17 +624,28 @@ index 6666666..7777777 100644
         let hunks = diff_texts(&old, &new, 3);
         assert_eq!(hunks.len(), 1);
         let h = &hunks[0];
-        assert_eq!((h.old_start, h.old_count, h.new_start, h.new_count), (7, 7, 7, 7));
+        assert_eq!(
+            (h.old_start, h.old_count, h.new_start, h.new_count),
+            (7, 7, 7, 7)
+        );
         assert_eq!(h.rows.len(), 8); // 3 ctx + 1 removed + 1 added + 3 ctx
         match &h.rows[0] {
-            DiffRow::Context { old_no, new_no, text } => {
+            DiffRow::Context {
+                old_no,
+                new_no,
+                text,
+            } => {
                 assert_eq!((*old_no, *new_no), (7, 7));
                 assert_eq!(text, "line 7");
             }
             other => panic!("expected context, got {other:?}"),
         }
         match &h.rows[3] {
-            DiffRow::Removed { old_no, text, intra } => {
+            DiffRow::Removed {
+                old_no,
+                text,
+                intra,
+            } => {
                 assert_eq!(*old_no, 10);
                 assert_eq!(text, "line 10");
                 // Intra-line pass ran on the paired change.
@@ -715,7 +727,11 @@ index 6666666..7777777 100644
         assert_eq!(hunks.len(), 1);
         assert_eq!((hunks[0].old_start, hunks[0].old_count), (1, 3));
         match hunks[0].rows.last().unwrap() {
-            DiffRow::Context { old_no, new_no, text } => {
+            DiffRow::Context {
+                old_no,
+                new_no,
+                text,
+            } => {
                 assert_eq!((*old_no, *new_no), (3, 3));
                 assert_eq!(text, "c");
             }
@@ -729,14 +745,27 @@ index 6666666..7777777 100644
         let hunks = diff_texts("", "a\nb\n", 3);
         assert_eq!(hunks.len(), 1);
         assert_eq!(
-            (hunks[0].old_start, hunks[0].old_count, hunks[0].new_start, hunks[0].new_count),
+            (
+                hunks[0].old_start,
+                hunks[0].old_count,
+                hunks[0].new_start,
+                hunks[0].new_count
+            ),
             (0, 0, 1, 2)
         );
-        assert!(hunks[0].rows.iter().all(|r| matches!(r, DiffRow::Added { .. })));
+        assert!(hunks[0]
+            .rows
+            .iter()
+            .all(|r| matches!(r, DiffRow::Added { .. })));
         // Deleted file mirrors it.
         let hunks = diff_texts("a\nb\n", "", 3);
         assert_eq!(
-            (hunks[0].old_start, hunks[0].old_count, hunks[0].new_start, hunks[0].new_count),
+            (
+                hunks[0].old_start,
+                hunks[0].old_count,
+                hunks[0].new_start,
+                hunks[0].new_count
+            ),
             (1, 2, 0, 0)
         );
     }
@@ -745,7 +774,12 @@ index 6666666..7777777 100644
     fn hunk_header_without_counts() {
         let hunk = parse_hunk_header("@@ -5 +7 @@").unwrap();
         assert_eq!(
-            (hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count),
+            (
+                hunk.old_start,
+                hunk.old_count,
+                hunk.new_start,
+                hunk.new_count
+            ),
             (5, 1, 7, 1)
         );
     }

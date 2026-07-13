@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+brokk-bifrost = "0.8.0"
 claude = { path = "../claude" }
 diff-core = { path = "../diff-core" }
 gh = { path = "../gh" }
@@ -18,3 +19,5 @@ gpui = "0.2"
 gpui-component = "0.5"
 gpui-component-assets = "0.5"
 fuzzy-matcher = "0.3"
+serde_json = { workspace = true }
+libc = "0.2"

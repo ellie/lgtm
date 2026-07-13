@@ -108,7 +108,9 @@ pub fn parse_line(line: &str) -> Option<ChatEvent> {
             if delta.get("type")?.as_str()? != "text_delta" {
                 return None;
             }
-            Some(ChatEvent::TextDelta(delta.get("text")?.as_str()?.to_string()))
+            Some(ChatEvent::TextDelta(
+                delta.get("text")?.as_str()?.to_string(),
+            ))
         }
         "result" => Some(ChatEvent::Completed {
             session_id: value

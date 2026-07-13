@@ -245,14 +245,7 @@ static CPP: Language = Language::new(|| {
         tree_sitter_cpp::HIGHLIGHT_QUERY,
         tree_sitter_c::HIGHLIGHT_QUERY
     );
-    HighlightConfiguration::new(
-        tree_sitter_cpp::LANGUAGE.into(),
-        "cpp",
-        &highlights,
-        "",
-        "",
-    )
-    .ok()
+    HighlightConfiguration::new(tree_sitter_cpp::LANGUAGE.into(), "cpp", &highlights, "", "").ok()
 });
 
 static JAVA: Language = Language::new(|| {
@@ -393,7 +386,11 @@ pub fn highlight_lines(lang: &Language, source: &str) -> Vec<Vec<(Range<usize>, 
         return out;
     };
     // End of a line's content (its newline excluded).
-    let line_end = |l: usize| line_starts.get(l + 1).map_or(source.len(), |&next| next - 1);
+    let line_end = |l: usize| {
+        line_starts
+            .get(l + 1)
+            .map_or(source.len(), |&next| next - 1)
+    };
 
     let mut stack: Vec<Token> = Vec::new();
     let mut line = 0usize;
