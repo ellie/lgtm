@@ -9,6 +9,79 @@ use std::process::Command;
 /// How many untracked files to inline into the patch before giving up.
 const MAX_UNTRACKED_FILES: usize = 200;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProfile {
+    pub command: Vec<String>,
+    pub destination: Option<String>,
+    pub remote_command_separator: Option<String>,
+}
+
+/// Parse a pasted connection command such as `ssh devbox` or a custom wrapper.
+pub fn parse_ssh_command(input: &str) -> Result<SshProfile> {
+    let tokens = shlex::split(input).ok_or_else(|| anyhow!("invalid SSH command quoting"))?;
+    if tokens.len() < 2 {
+        bail!("expected an SSH command and destination, for example `ssh devbox`");
+    }
+
+    // Some wrappers supply the destination themselves and require `--` before
+    // the command sent to the remote shell.
+    let is_wrapper = tokens.last().is_some_and(|token| token == "ssh")
+        || (tokens.len() >= 2
+            && tokens[tokens.len() - 2] == "ssh"
+            && tokens.last().is_some_and(|token| token == "--"));
+    if is_wrapper {
+        let command_len = if tokens.last().is_some_and(|token| token == "--") {
+            tokens.len() - 1
+        } else {
+            tokens.len()
+        };
+        return Ok(SshProfile {
+            command: tokens[..command_len].to_vec(),
+            destination: None,
+            remote_command_separator: Some("--".into()),
+        });
+    }
+
+    let destination = tokens.last().cloned().unwrap();
+    if destination.starts_with('-') || destination.chars().any(char::is_whitespace) {
+        bail!("SSH destination is missing");
+    }
+    Ok(SshProfile {
+        command: tokens[..tokens.len() - 1].to_vec(),
+        destination: Some(destination),
+        remote_command_separator: None,
+    })
+}
+
+impl SshProfile {
+    pub fn display(&self) -> String {
+        let mut parts = self.command.clone();
+        if let Some(destination) = &self.destination {
+            parts.push(destination.clone());
+        }
+        if let Some(separator) = &self.remote_command_separator {
+            parts.push(separator.clone());
+        }
+        parts.join(" ")
+    }
+
+    pub fn label(&self) -> String {
+        self.destination
+            .clone()
+            .unwrap_or_else(|| self.command.join(" "))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteSource {
+    pub profile: SshProfile,
+    pub repo_root: String,
+    pub branch: String,
+    pub base_ref: Option<String>,
+    pub base_label: String,
+    pub base_oid: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalSource {
     pub repo_root: PathBuf,
@@ -162,6 +235,251 @@ fn push_remote_head(repo_root: &Path, remote: &str, candidates: &mut Vec<String>
     }
 }
 
+pub fn resolve_remote(
+    profile: &SshProfile,
+    path: &str,
+    base_ref: Option<&str>,
+) -> Result<RemoteSource> {
+    let repo_root = remote_git(profile, path, &["rev-parse", "--show-toplevel"])?
+        .trim()
+        .to_string();
+    let branch = remote_git(profile, &repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+
+    if let Some(base_ref) = base_ref {
+        let base_ref = base_ref.trim();
+        let base_oid = if base_ref == "HEAD" {
+            remote_git(profile, &repo_root, &["rev-parse", "HEAD"])
+                .ok()
+                .map(|oid| oid.trim().to_string())
+        } else {
+            Some(
+                remote_git(profile, &repo_root, &["merge-base", "HEAD", base_ref])?
+                    .trim()
+                    .to_string(),
+            )
+        };
+        return Ok(RemoteSource {
+            profile: profile.clone(),
+            repo_root,
+            branch,
+            base_ref: Some(base_ref.to_string()),
+            base_label: base_ref.to_string(),
+            base_oid,
+        });
+    }
+
+    let mut base_oid = None;
+    let mut base_label = "HEAD".to_string();
+    for candidate in remote_default_base_candidates(profile, &repo_root) {
+        if candidate == branch {
+            continue;
+        }
+        if let Ok(oid) = remote_git(profile, &repo_root, &["merge-base", "HEAD", &candidate]) {
+            base_oid = Some(oid.trim().to_string());
+            base_label = candidate;
+            break;
+        }
+    }
+    if base_oid.is_none() {
+        base_oid = remote_git(profile, &repo_root, &["rev-parse", "HEAD"])
+            .ok()
+            .map(|oid| oid.trim().to_string());
+    }
+
+    Ok(RemoteSource {
+        profile: profile.clone(),
+        repo_root,
+        branch,
+        base_ref: None,
+        base_label,
+        base_oid,
+    })
+}
+
+pub fn list_remote_base_refs(profile: &SshProfile, path: &str) -> Result<Vec<String>> {
+    let repo_root = remote_git(profile, path, &["rev-parse", "--show-toplevel"])?
+        .trim()
+        .to_string();
+    let branch = remote_git(profile, &repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        .trim()
+        .to_string();
+    let mut candidates = remote_default_base_candidates(profile, &repo_root);
+    push_unique(&mut candidates, "HEAD".to_string());
+    let refs = remote_git(
+        profile,
+        &repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    for candidate in refs
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if candidate == branch || candidate.ends_with("/HEAD") {
+            continue;
+        }
+        push_unique(&mut candidates, candidate.to_string());
+    }
+    Ok(candidates
+        .into_iter()
+        .filter(|candidate| {
+            candidate == "HEAD"
+                || remote_git(profile, &repo_root, &["merge-base", "HEAD", candidate]).is_ok()
+        })
+        .collect())
+}
+
+pub fn remote_diff_patch(src: &RemoteSource) -> Result<String> {
+    let base = src.base_oid.as_deref().unwrap_or("HEAD");
+    let mut patch = remote_git(
+        &src.profile,
+        &src.repo_root,
+        &["diff", "-M", "--no-color", "--no-ext-diff", base],
+    )?;
+    let untracked = remote_git(
+        &src.profile,
+        &src.repo_root,
+        &["ls-files", "--others", "--exclude-standard"],
+    )?;
+    for file in untracked.lines().take(MAX_UNTRACKED_FILES) {
+        let output = run_ssh(
+            &src.profile,
+            remote_git_command(
+                &src.repo_root,
+                &[
+                    "diff".to_string(),
+                    "--no-color".to_string(),
+                    "--no-ext-diff".to_string(),
+                    "--no-index".to_string(),
+                    "--".to_string(),
+                    "/dev/null".to_string(),
+                    file.to_string(),
+                ],
+            ),
+        )?;
+        if !matches!(output.status.code(), Some(0) | Some(1)) {
+            bail!(
+                "remote git diff --no-index {file} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        patch.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    Ok(patch)
+}
+
+pub fn remote_file_at_base(src: &RemoteSource, path: &str) -> Option<String> {
+    let oid = src.base_oid.as_deref()?;
+    remote_git(
+        &src.profile,
+        &src.repo_root,
+        &["show", &format!("{oid}:{path}")],
+    )
+    .ok()
+}
+
+pub fn remote_file_at_worktree(src: &RemoteSource, path: &str) -> Option<String> {
+    let output = run_ssh(
+        &src.profile,
+        remote_shell_command(
+            "cat",
+            &[format!("{}/{}", src.repo_root.trim_end_matches('/'), path)],
+        ),
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn remote_default_base_candidates(profile: &SshProfile, repo_root: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for remote in ["origin", "upstream"] {
+        if let Ok(symref) = remote_git(
+            profile,
+            repo_root,
+            &["symbolic-ref", &format!("refs/remotes/{remote}/HEAD")],
+        ) {
+            if let Some(name) = symref.trim().strip_prefix("refs/remotes/") {
+                push_unique(&mut candidates, name.to_string());
+            }
+        }
+    }
+    for candidate in [
+        "origin/main",
+        "upstream/main",
+        "origin/master",
+        "upstream/master",
+        "main",
+        "master",
+    ] {
+        push_unique(&mut candidates, candidate.to_string());
+    }
+    candidates
+}
+
+fn remote_git(profile: &SshProfile, repo_root: &str, args: &[&str]) -> Result<String> {
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let output = run_ssh(profile, remote_git_command(repo_root, &args))?;
+    if !output.status.success() {
+        bail!(
+            "remote git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_ssh(profile: &SshProfile, remote_command: String) -> Result<std::process::Output> {
+    let (program, args) = profile
+        .command
+        .split_first()
+        .context("SSH command is empty")?;
+    Command::new(program)
+        .args(args)
+        .args(profile.destination.iter())
+        .args(profile.remote_command_separator.iter())
+        .arg(remote_command)
+        .output()
+        .map_err(|err| anyhow!("failed to run SSH command: {err}"))
+}
+
+fn remote_git_command(root: &str, args: &[String]) -> String {
+    let mut command = vec!["git".to_string(), "-C".to_string(), root.to_string()];
+    command.extend(args.iter().cloned());
+    remote_shell_command_parts(&command)
+}
+
+fn remote_shell_command(program: &str, args: &[String]) -> String {
+    let mut command = vec![program.to_string()];
+    command.extend(args.iter().cloned());
+    remote_shell_command_parts(&command)
+}
+
+fn remote_shell_command_parts(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| shell_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Full contents of `path` at the captured diff base, for the Phase-2 upgrade.
 /// None means "old side absent or unusable": untracked/added files, binary or
 /// non-UTF-8 content, or no base commit. Errors collapse to None too — the
@@ -266,6 +584,71 @@ mod tests {
         run(dir, &["git", "config", "user.email", "test@example.com"]);
         run(dir, &["git", "config", "user.name", "Test"]);
         run(dir, &["git", "config", "commit.gpgsign", "false"]);
+    }
+
+    #[test]
+    fn parses_pasted_ssh_commands() {
+        assert_eq!(
+            parse_ssh_command("ssh -p 2222 user@example.com").unwrap(),
+            SshProfile {
+                command: vec!["ssh".into(), "-p".into(), "2222".into()],
+                destination: Some("user@example.com".into()),
+                remote_command_separator: None,
+            }
+        );
+        assert_eq!(
+            parse_ssh_command("custom ssh --profile devbox devbox").unwrap(),
+            SshProfile {
+                command: vec![
+                    "custom".into(),
+                    "ssh".into(),
+                    "--profile".into(),
+                    "devbox".into()
+                ],
+                destination: Some("devbox".into()),
+                remote_command_separator: None,
+            }
+        );
+        assert_eq!(
+            parse_ssh_command("custom ssh").unwrap(),
+            SshProfile {
+                command: vec!["custom".into(), "ssh".into()],
+                destination: None,
+                remote_command_separator: Some("--".into()),
+            }
+        );
+        assert_eq!(parse_ssh_command("custom ssh").unwrap().display(), "custom ssh --");
+        assert!(parse_ssh_command("ssh devbox 'git status'").is_err());
+        assert!(parse_ssh_command("ssh").is_err());
+    }
+
+    #[test]
+    fn remote_commands_quote_paths_and_arguments() {
+        assert_eq!(
+            remote_git_command(
+                "/tmp/repo with space",
+                &["show".into(), "HEAD:it's here.rs".into()]
+            ),
+            "'git' '-C' '/tmp/repo with space' 'show' 'HEAD:it'\\''s here.rs'"
+        );
+        assert_eq!(
+            remote_shell_command("cat", &["/tmp/repo/it's here.rs".into()]),
+            "'cat' '/tmp/repo/it'\\''s here.rs'"
+        );
+    }
+
+    #[test]
+    fn wrapper_profiles_separate_remote_commands() {
+        let profile = SshProfile {
+            command: vec!["/bin/echo".into(), "custom".into(), "ssh".into()],
+            destination: None,
+            remote_command_separator: Some("--".into()),
+        };
+        let output = run_ssh(&profile, "remote command".into()).unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "custom ssh -- remote command\n"
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+shlex = "1"
 
 [dev-dependencies]
 diff-core = { path = "../diff-core" }

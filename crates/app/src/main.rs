@@ -2126,6 +2126,7 @@ fn render_tree_row(
 enum Source {
     Pr(gh::PrLocator),
     Local(git::LocalSource),
+    Remote(git::RemoteSource),
 }
 
 enum ItemState {
@@ -2286,6 +2287,7 @@ impl ReviewItem {
         match &self.source {
             Source::Pr(loc) => format!("{}#{}", loc.repo_slug(), loc.number).into(),
             Source::Local(src) => src.branch.clone().into(),
+            Source::Remote(src) => src.branch.clone().into(),
         }
     }
 
@@ -2303,12 +2305,15 @@ impl ReviewItem {
             Source::Local(src) => {
                 format!("{} ← {}", dir_name(&src.repo_root), src.base_label).into()
             }
+            Source::Remote(src) => {
+                format!("{} ← {}", remote_dir_name(&src.repo_root), src.base_label).into()
+            }
         }
     }
 
     fn dot_color(&self) -> gpui::Rgba {
         match &self.source {
-            Source::Local(_) => theme::blue(),
+            Source::Local(_) | Source::Remote(_) => theme::blue(),
             Source::Pr(_) => match &self.state {
                 ItemState::Ready(data) => match data.pr_meta.as_ref().map(|m| m.state.as_str()) {
                     Some("OPEN") => theme::green(),
@@ -2344,6 +2349,10 @@ impl ReviewItem {
             LoadedMeta::Local(src) => {
                 // Branch/base may have moved since open; keep the label fresh.
                 self.source = Source::Local(src);
+                None
+            }
+            LoadedMeta::Remote(src) => {
+                self.source = Source::Remote(src);
                 None
             }
         };
@@ -2383,7 +2392,7 @@ impl ReviewItem {
             }
             _ => {
                 let minimap = minimap_rows(&rows);
-                let local_review = matches!(&self.source, Source::Local(_))
+                let local_review = matches!(&self.source, Source::Local(_) | Source::Remote(_))
                     .then(LocalReview::default);
                 let comments = match &local_review {
                     Some(local) => Some(local.index()),
@@ -2438,9 +2447,19 @@ fn dir_name(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+fn remote_dir_name(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+        .to_string()
+}
+
 enum LoadedMeta {
     Pr(gh::PrMeta),
     Local(git::LocalSource),
+    Remote(git::RemoteSource),
 }
 
 struct Loaded {
@@ -2481,6 +2500,11 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             let patch = git::diff_patch(&src)?;
             (LoadedMeta::Local(src), patch, None)
         }
+        Source::Remote(src) => {
+            let src = git::resolve_remote(&src.profile, &src.repo_root, src.base_ref.as_deref())?;
+            let patch = git::remote_diff_patch(&src)?;
+            (LoadedMeta::Remote(src), patch, None)
+        }
     };
     let diff = diff_core::parse_patch(&patch);
     let (rows, file_rows, hunk_rows) =
@@ -2515,6 +2539,7 @@ enum UpgradeSource {
         head_oid: String,
     },
     Local(git::LocalSource),
+    Remote(git::RemoteSource),
 }
 
 /// One file's fetch inputs, snapshotted from the parsed patch (paths and
@@ -2589,6 +2614,13 @@ fn fetch_side(source: &UpgradeSource, path: &str, old: bool) -> Option<String> {
                 git::file_at_base(src, path)?
             } else {
                 String::from_utf8(std::fs::read(src.repo_root.join(path)).ok()?).ok()?
+            }
+        }
+        UpgradeSource::Remote(src) => {
+            if old {
+                git::remote_file_at_base(src, path)?
+            } else {
+                git::remote_file_at_worktree(src, path)?
             }
         }
     };
@@ -2869,6 +2901,75 @@ fn local_titlebar_content(
         .into_any_element()
 }
 
+fn remote_titlebar_content(
+    src: &git::RemoteSource,
+    data: &ItemData,
+    cx: &mut Context<ReviewApp>,
+) -> gpui::AnyElement {
+    let blue: Hsla = theme::blue().into();
+    div()
+        .flex()
+        .items_center()
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .flex_1()
+                .child(
+                    Tag::custom(blue.opacity(0.15), blue, blue.opacity(0.4))
+                        .small()
+                        .child(SharedString::from("remote")),
+                )
+                .child(div().font_weight(gpui::FontWeight::BOLD).truncate().child(
+                    SharedString::from(format!(
+                        "{}:{}",
+                        src.profile.label(),
+                        remote_dir_name(&src.repo_root)
+                    )),
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                .pr_3()
+                .child(
+                    div()
+                        .text_color(theme::overlay0())
+                        .child(SharedString::from(format!(
+                            "{} ← {}",
+                            src.base_label, src.branch
+                        ))),
+                )
+                .child(
+                    div()
+                        .text_color(theme::green())
+                        .child(SharedString::from(format!("+{}", data.additions))),
+                )
+                .child(
+                    div()
+                        .text_color(theme::red())
+                        .child(SharedString::from(format!("−{}", data.deletions))),
+                )
+                .child(
+                    Button::new("copy-remote-review-prompt")
+                        .label("Copy prompt")
+                        .primary()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_local_review_prompt(cx);
+                        })),
+                ),
+        )
+        .into_any_element()
+}
+
 /// The cmd-k command palette: a staged flow for opening things.
 enum PaletteStep {
     /// Step 1: pick what to open.
@@ -2877,6 +2978,13 @@ enum PaletteStep {
     RepoInput { error: Option<SharedString> },
     /// Step 3 (GitHub path): pick a PR from the repo's open list.
     PrList { repo: String, prs: PrListState },
+    /// SSH path: paste a standard SSH command or custom wrapper.
+    SshCommandInput { error: Option<SharedString> },
+    /// SSH path: enter the repository directory on the selected host.
+    SshPathInput {
+        profile: git::SshProfile,
+        error: Option<SharedString>,
+    },
     /// Local path: pick the base ref for an already-open local item.
     LocalBaseList {
         item_id: u64,
@@ -2910,9 +3018,14 @@ enum BaseListState {
     Failed(String),
 }
 
-const PALETTE_SOURCES: [&str; 2] = ["Open GitHub pull request", "Open local folder"];
+const PALETTE_SOURCES: [&str; 3] = [
+    "Open GitHub pull request",
+    "Open local folder",
+    "Open SSH repository",
+];
 const SOURCE_PR: usize = 0;
 const SOURCE_FOLDER: usize = 1;
+const SOURCE_SSH: usize = 2;
 const PALETTE_ROW_HEIGHT: f32 = 30.0;
 
 /// Step-1 options matching the query (case-insensitive substring), as indices
@@ -3185,6 +3298,13 @@ fn local_chat_header(src: &git::LocalSource) -> String {
     )
 }
 
+fn remote_chat_header(src: &git::RemoteSource) -> String {
+    format!(
+        "Remote diff under review: {}:{}, branch {} against {}.",
+        src.profile.label(), src.repo_root, src.branch, src.base_label,
+    )
+}
+
 /// The full prompt for one turn. `context` (header + raw patch) is only
 /// present on a session's first message; the patch is capped at
 /// [`MAX_CHAT_PATCH_BYTES`] with the truncation noted in the prompt.
@@ -3216,7 +3336,7 @@ fn chat_prompt(
     out
 }
 
-fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
+fn local_review_prompt(base_label: &str, branch: &str, review: &LocalReview) -> String {
     let threads = local_review_threads(review)
         .iter()
         .map(format_local_thread_prompt)
@@ -3224,7 +3344,7 @@ fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
         .join("\n=====\n");
     format!(
         "Diff: {} ← {}. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\n{}",
-        src.base_label, src.branch, threads
+        base_label, branch, threads
     )
 }
 
@@ -3405,6 +3525,7 @@ fn materialize_files(root: &Path, files: &[(String, String)]) -> Option<std::pat
 fn lsp_root_for_source(source: &Source, pr_meta: Option<&gh::PrMeta>) -> anyhow::Result<PathBuf> {
     match source {
         Source::Local(src) => Ok(src.repo_root.clone()),
+        Source::Remote(_) => bail!("LSP is not available for SSH reviews yet"),
         Source::Pr(loc) => {
             let meta = pr_meta.context("PR metadata missing; cannot materialize LSP worktree")?;
             if meta.head_ref_oid.is_empty() {
@@ -3880,6 +4001,27 @@ impl ReviewApp {
         cx.notify();
     }
 
+    fn open_remote_from_palette(
+        &mut self,
+        profile: git::SshProfile,
+        repo_root: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_palette(window, cx);
+        self.open_item(
+            Source::Remote(git::RemoteSource {
+                profile,
+                branch: remote_dir_name(&repo_root),
+                base_ref: None,
+                base_label: "…".to_string(),
+                base_oid: None,
+                repo_root,
+            }),
+            cx,
+        );
+    }
+
     fn spawn_fetch(id: u64, source: Source, mode: ViewMode, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             let fetched = cx
@@ -3894,7 +4036,7 @@ impl ReviewApp {
                 match fetched {
                     Ok(loaded) => {
                         item.install(loaded);
-                        restart_lsp = true;
+                        restart_lsp = !matches!(item.source, Source::Remote(_));
                         // Phase 2: after the instant patch-derived paint,
                         // upgrade every eligible file to full contents in the
                         // background. The bumped generation cancels any
@@ -3931,6 +4073,7 @@ impl ReviewApp {
                                         head_oid: meta.head_ref_oid.clone(),
                                     }),
                                 Source::Local(src) => Some(UpgradeSource::Local(src.clone())),
+                                Source::Remote(src) => Some(UpgradeSource::Remote(src.clone())),
                             };
                             if let (Some(source), false) = (source, jobs.is_empty()) {
                                 Self::spawn_upgrade(id, gen, source, jobs, cx);
@@ -4235,6 +4378,21 @@ impl ReviewApp {
                 self.set_palette_input(&repo, "owner/repo", window, cx);
                 cx.notify();
             }
+            Some(PaletteStep::SshCommandInput { .. }) => {
+                self.palette = Some(PaletteStep::Sources {
+                    selected: SOURCE_SSH,
+                });
+                self.palette_gen += 1;
+                self.set_palette_input("", "type to filter…", window, cx);
+                cx.notify();
+            }
+            Some(PaletteStep::SshPathInput { profile, .. }) => {
+                let command = profile.display();
+                self.palette = Some(PaletteStep::SshCommandInput { error: None });
+                self.palette_gen += 1;
+                self.set_palette_input(&command, "ssh host or custom SSH command…", window, cx);
+                cx.notify();
+            }
             Some(PaletteStep::LocalBaseList { .. }) => self.close_palette(window, cx),
         }
     }
@@ -4273,6 +4431,7 @@ impl ReviewApp {
                         .scroll_to_item(*selected, ScrollStrategy::Top);
                 }
             }
+            Some(PaletteStep::SshCommandInput { .. }) | Some(PaletteStep::SshPathInput { .. }) => {}
             _ => return,
         }
         cx.notify();
@@ -4307,6 +4466,8 @@ impl ReviewApp {
                 *selected = 0;
                 self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
             }
+            Some(PaletteStep::SshCommandInput { error }) => *error = None,
+            Some(PaletteStep::SshPathInput { error, .. }) => *error = None,
             _ => return,
         }
         cx.notify();
@@ -4330,6 +4491,29 @@ impl ReviewApp {
                     }
                 }
             },
+            Some(PaletteStep::SshCommandInput { .. }) => match git::parse_ssh_command(&query) {
+                Ok(profile) => {
+                    self.palette = Some(PaletteStep::SshPathInput {
+                        profile,
+                        error: None,
+                    });
+                    self.palette_gen += 1;
+                    self.set_palette_input("", "remote repository path…", window, cx);
+                    cx.notify();
+                }
+                Err(err) => {
+                    if let Some(PaletteStep::SshCommandInput { error }) = &mut self.palette {
+                        *error = Some(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                }
+            },
+            Some(PaletteStep::SshPathInput { profile, .. }) => {
+                if query.is_empty() {
+                    return;
+                }
+                self.open_remote_from_palette(profile.clone(), query, window, cx);
+            }
             Some(PaletteStep::PrList {
                 prs: PrListState::Loaded { selected, .. },
                 ..
@@ -4360,6 +4544,12 @@ impl ReviewApp {
                 // The palette closes when the native dialog opens.
                 self.close_palette(window, cx);
                 self.prompt_open_folder(cx);
+            }
+            SOURCE_SSH => {
+                self.palette = Some(PaletteStep::SshCommandInput { error: None });
+                self.palette_gen += 1;
+                self.set_palette_input("", "ssh host or custom SSH command…", window, cx);
+                cx.notify();
             }
             _ => {}
         }
@@ -4427,6 +4617,7 @@ impl ReviewApp {
             .find(|item| item.id == item_id)
             .and_then(|item| match &item.source {
                 Source::Local(src) => Some(src.base_label.clone()),
+                Source::Remote(src) => Some(src.base_label.clone()),
                 Source::Pr(_) => None,
             })
             .unwrap_or_else(|| "HEAD".to_string());
@@ -4519,6 +4710,7 @@ impl ReviewApp {
         };
         let branch = match &item.source {
             Source::Local(src) => src.branch.clone(),
+            Source::Remote(src) => src.branch.clone(),
             Source::Pr(_) => dir_name(&repo_root),
         };
         let source = Source::Local(git::LocalSource {
@@ -5176,7 +5368,7 @@ impl ReviewApp {
         if reply_to.is_none() {
             match &item.source {
                 Source::Pr(_) if commit_id.is_empty() => return,
-                Source::Pr(_) | Source::Local(_) => {}
+                Source::Pr(_) | Source::Local(_) | Source::Remote(_) => {}
             }
         }
         self.composer_gen += 1;
@@ -5250,7 +5442,7 @@ impl ReviewApp {
                 composer.line,
             )
         };
-        if let Source::Local(_) = source {
+        if matches!(source, Source::Local(_) | Source::Remote(_)) {
             self.add_local_comment(item_id, reply_to, path, side, line, body, cx);
             if self.composer_gen == gen {
                 self.close_composer(window, cx);
@@ -5330,8 +5522,10 @@ impl ReviewApp {
         let Some(item) = self.active_item() else {
             return;
         };
-        let Source::Local(src) = &item.source else {
-            return;
+        let (base_label, branch) = match &item.source {
+            Source::Local(src) => (&src.base_label, &src.branch),
+            Source::Remote(src) => (&src.base_label, &src.branch),
+            Source::Pr(_) => return,
         };
         let ItemState::Ready(data) = &item.state else {
             return;
@@ -5339,7 +5533,9 @@ impl ReviewApp {
         let Some(local) = &data.local_review else {
             return;
         };
-        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(src, local)));
+        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(
+            base_label, branch, local,
+        )));
     }
 
     /// Refetch only the review comments (not meta/patch), regroup, and
@@ -5615,6 +5811,7 @@ impl ReviewApp {
                 format!("PR under review: {}#{}", loc.repo_slug(), loc.number)
             }
             (Source::Local(src), _) => local_chat_header(src),
+            (Source::Remote(src), _) => remote_chat_header(src),
         });
         let prompt = chat_prompt(
             header.as_deref().map(|h| (h, data.patch.as_str())),
@@ -5626,6 +5823,7 @@ impl ReviewApp {
             Some(dir) => ExplorePlan::Dir(dir.clone()),
             None => match &source {
                 Source::Local(src) => ExplorePlan::Dir(src.repo_root.clone()),
+                Source::Remote(_) => ExplorePlan::None,
                 // PR with blob-upgraded contents: materialize the new-side
                 // files once, at session start.
                 Source::Pr(_) if first && !data.upgrades.is_empty() => {
@@ -6481,6 +6679,7 @@ impl ReviewApp {
                         None => app_title(None),
                     },
                     Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
+                    Source::Remote(src) => remote_titlebar_content(src, data, cx),
                 },
                 ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
                 ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),
@@ -6757,6 +6956,8 @@ impl ReviewApp {
             PaletteStep::Sources { .. } => None,
             PaletteStep::RepoInput { .. } => Some("Open GitHub pull request".into()),
             PaletteStep::PrList { repo, .. } => Some(repo.clone().into()),
+            PaletteStep::SshCommandInput { .. } => Some("Open SSH repository".into()),
+            PaletteStep::SshPathInput { profile, .. } => Some(profile.display().into()),
             PaletteStep::LocalBaseList { .. } => Some("Choose local diff base".into()),
         };
 
@@ -6808,6 +7009,36 @@ impl ReviewApp {
                     Some(err) => (err.clone(), theme::red()),
                     None => (
                         "enter to list open pull requests · esc to go back".into(),
+                        theme::overlay0(),
+                    ),
+                };
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_color(color)
+                    .child(text)
+                    .into_any_element()
+            }
+            PaletteStep::SshCommandInput { error } => {
+                let (text, color): (SharedString, gpui::Rgba) = match error {
+                    Some(err) => (err.clone(), theme::red()),
+                    None => (
+                        "paste a connection command, then press enter".into(),
+                        theme::overlay0(),
+                    ),
+                };
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_color(color)
+                    .child(text)
+                    .into_any_element()
+            }
+            PaletteStep::SshPathInput { error, .. } => {
+                let (text, color): (SharedString, gpui::Rgba) = match error {
+                    Some(err) => (err.clone(), theme::red()),
+                    None => (
+                        "enter the remote Git repository path".into(),
                         theme::overlay0(),
                     ),
                 };
@@ -7466,7 +7697,7 @@ impl Render for ReviewApp {
                     this.submit_review(window, cx);
                 } else if matches!(
                     this.active_item().map(|item| &item.source),
-                    Some(Source::Local(_))
+                    Some(Source::Local(_) | Source::Remote(_))
                 ) {
                     this.copy_local_review_prompt(cx);
                 } else {
@@ -8260,10 +8491,11 @@ mod tests {
 
     #[test]
     fn source_options_filter_by_substring() {
-        assert_eq!(filtered_sources(""), vec![0, 1]);
+        assert_eq!(filtered_sources(""), vec![0, 1, 2]);
         assert_eq!(filtered_sources("pull"), vec![0]);
         assert_eq!(filtered_sources("FOLDER"), vec![1]);
-        assert_eq!(filtered_sources("open"), vec![0, 1]);
+        assert_eq!(filtered_sources("ssh"), vec![2]);
+        assert_eq!(filtered_sources("open"), vec![0, 1, 2]);
         assert!(filtered_sources("nope").is_empty());
     }
 
@@ -9315,7 +9547,7 @@ mod tests {
         );
 
         assert_eq!(
-            local_review_prompt(&src, &review),
+            local_review_prompt(&src.base_label, &src.branch, &review),
             "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
         );
     }
