@@ -2501,7 +2501,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
             (LoadedMeta::Local(src), patch, None)
         }
         Source::Remote(src) => {
-            let src = git::resolve_remote(&src.profile, &src.repo_root, src.base_ref.as_deref())?;
+            let src = git::resolve_remote(src)?;
             let patch = git::remote_diff_patch(&src)?;
             (LoadedMeta::Remote(src), patch, None)
         }
@@ -2528,7 +2528,8 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
 const MAX_UPGRADE_FILES: usize = 400;
 /// Per-side blob cap; gh::fetch_file_at enforces the same limit for PRs.
 const MAX_UPGRADE_BLOB_BYTES: usize = 1024 * 1024;
-/// gh/git are one subprocess per call, so a small worker pool is plenty.
+/// GitHub and local Git fetches are one subprocess per call, so a small worker
+/// pool is plenty; remote sessions are serialized by their connection manager.
 const UPGRADE_WORKERS: usize = 4;
 
 /// Where to fetch full file contents from, snapshotted when an item loads.
@@ -3782,6 +3783,7 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    ssh_connections: git::SshConnectionManager,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3888,6 +3890,7 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            ssh_connections: git::SshConnectionManager::default(),
             _subscriptions,
         };
         for source in sources {
@@ -4011,6 +4014,7 @@ impl ReviewApp {
         self.close_palette(window, cx);
         self.open_item(
             Source::Remote(git::RemoteSource {
+                connections: self.ssh_connections.clone(),
                 profile,
                 branch: remote_dir_name(&repo_root),
                 base_ref: None,
