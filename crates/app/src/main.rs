@@ -333,7 +333,7 @@ struct CommentThread {
 /// One file's threads, keyed by anchor.
 type FileAnchors = HashMap<(CommentSide, u64), Vec<CommentThread>>;
 
-/// All review comments of a PR, grouped for row building.
+/// Review comments grouped for row building.
 #[derive(Debug, Default)]
 struct CommentIndex {
     /// path → (side, line) → threads in root-created order.
@@ -348,7 +348,7 @@ struct CommentIndex {
 fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
     // ISO-8601 UTC strings sort lexicographically = chronologically, so this
     // orders roots before their replies and threads by root creation.
-    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
     let mut threads: Vec<CommentThread> = Vec::new();
     // Comment id (root or reply) → thread index, so replies-to-replies still
     // land in the right thread.
@@ -394,6 +394,42 @@ fn group_comments(mut comments: Vec<gh::ReviewComment>) -> CommentIndex {
             .push(thread);
     }
     index
+}
+
+#[derive(Debug, Default)]
+struct LocalReview {
+    comments: Vec<gh::ReviewComment>,
+    next_id: u64,
+}
+
+impl LocalReview {
+    fn index(&self) -> CommentIndex {
+        group_comments(self.comments.clone())
+    }
+
+    fn add_comment(
+        &mut self,
+        reply_to: Option<u64>,
+        path: String,
+        side: CommentSide,
+        line: u64,
+        body: String,
+    ) {
+        self.next_id += 1;
+        self.comments.push(gh::ReviewComment {
+            id: self.next_id,
+            path,
+            line: Some(line),
+            side: Some(side.api_str().to_string()),
+            start_line: None,
+            body,
+            user: gh::Author {
+                login: "you".to_string(),
+            },
+            created_at: "draft".to_string(),
+            in_reply_to_id: reply_to,
+        });
+    }
 }
 
 /// Comment bodies soft-wrap at this many chars (the pane is monospace).
@@ -830,7 +866,7 @@ fn push_gap_rows(
 /// hunk headers. Split mode pairs removed/added runs positionally into
 /// two-cell rows; unequal runs leave one-sided rows. Files present in
 /// `upgrades` use whole-file syntax spans and get gap rows between hunks.
-/// Review threads (PR items) render beneath the line they anchor to when
+/// Review threads render beneath the line they anchor to when
 /// `show_comments` is set; file headers always carry the comment counts.
 fn build_rows(
     diff: &PrDiff,
@@ -2131,8 +2167,9 @@ struct ItemData {
     /// themselves replace `diff.files[ix].hunks`. Reset on refresh.
     upgrades: HashMap<usize, FileUpgrade>,
     /// Review threads grouped by anchor; Some for PR items (possibly empty),
-    /// None for local items, which have no comment affordances at all.
+    /// and for local items with in-memory draft comments.
     comments: Option<CommentIndex>,
+    local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
     /// Sidebar file tree, rebuilt whenever the diff itself changes (load,
@@ -2316,10 +2353,14 @@ impl ReviewItem {
                 // Fresh patch-derived data: any previous upgrade (and its
                 // expanded gaps) is stale — the upgrade re-runs from scratch.
                 data.upgrades.clear();
-                data.comments = comments;
-                if data.mode != mode || !data.comments_visible {
-                    // The user toggled unified/split (or hid comments) while
-                    // the refresh ran; the background rows assumed otherwise.
+                data.comments = match &data.local_review {
+                    Some(local) => Some(local.index()),
+                    None => comments,
+                };
+                if data.local_review.is_some() || data.mode != mode || !data.comments_visible {
+                    // Background rows assumed the fetched comments. Local
+                    // drafts are reattached here, and view/comment toggles may
+                    // have changed while the refresh ran.
                     (rows, file_rows, hunk_rows) = build_rows(
                         &diff,
                         data.mode,
@@ -2342,6 +2383,12 @@ impl ReviewItem {
             }
             _ => {
                 let minimap = minimap_rows(&rows);
+                let local_review = matches!(&self.source, Source::Local(_))
+                    .then(LocalReview::default);
+                let comments = match &local_review {
+                    Some(local) => Some(local.index()),
+                    None => comments,
+                };
                 let mut data = Box::new(ItemData {
                     pr_meta,
                     diff,
@@ -2360,6 +2407,7 @@ impl ReviewItem {
                     selection: None,
                     upgrades: HashMap::new(),
                     comments,
+                    local_review,
                     comments_visible: true,
                     tree: Vec::new(),
                     collapsed: HashSet::new(),
@@ -2807,6 +2855,15 @@ fn local_titlebar_content(
                     div()
                         .text_color(theme::red())
                         .child(SharedString::from(format!("−{}", data.deletions))),
+                )
+                .child(
+                    Button::new("copy-local-review-prompt")
+                        .label("Copy prompt")
+                        .primary()
+                        .xsmall()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.copy_local_review_prompt(cx);
+                        })),
                 ),
         )
         .into_any_element()
@@ -3157,6 +3214,73 @@ fn chat_prompt(
     }
     out.push_str(question);
     out
+}
+
+fn local_review_prompt(src: &git::LocalSource, review: &LocalReview) -> String {
+    let threads = local_review_threads(review)
+        .iter()
+        .map(format_local_thread_prompt)
+        .collect::<Vec<_>>()
+        .join("\n=====\n");
+    format!(
+        "Diff: {} ← {}. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\n{}",
+        src.base_label, src.branch, threads
+    )
+}
+
+fn local_review_threads(review: &LocalReview) -> Vec<CommentThread> {
+    let mut comments = review.comments.clone();
+    comments.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let mut threads = Vec::new();
+    let mut thread_of: HashMap<u64, usize> = HashMap::new();
+    for comment in comments {
+        match comment.in_reply_to_id {
+            None => {
+                thread_of.insert(comment.id, threads.len());
+                threads.push(CommentThread {
+                    root: comment,
+                    replies: Vec::new(),
+                });
+            }
+            Some(parent) => {
+                if let Some(&ix) = thread_of.get(&parent) {
+                    thread_of.insert(comment.id, ix);
+                    threads[ix].replies.push(comment);
+                }
+            }
+        }
+    }
+    threads
+}
+
+fn format_local_thread_prompt(thread: &CommentThread) -> String {
+    let file = if thread.root.path.is_empty() {
+        "<unknown file>"
+    } else {
+        &thread.root.path
+    };
+    let mut sections = vec![
+        local_comment_location(file, thread.root.side.as_deref(), thread.root.line),
+        thread.root.body.clone(),
+    ];
+    for (ix, reply) in thread.replies.iter().enumerate() {
+        let author = if reply.user.login.trim().is_empty() {
+            "Unknown"
+        } else {
+            reply.user.login.as_str()
+        };
+        sections.push(format!("Reply {} ({author})", ix + 1));
+        sections.push(reply.body.clone());
+    }
+    sections.join("\n")
+}
+
+fn local_comment_location(file: &str, side: Option<&str>, line: Option<u64>) -> String {
+    let line = line.unwrap_or(0);
+    match side {
+        Some("LEFT") => format!("{file}:L{line}"),
+        _ => format!("{file}:R{line}"),
+    }
 }
 
 /// What a selection pins down for the chat: the anchor triple (path, side,
@@ -3527,7 +3651,7 @@ struct ReviewApp {
     char_width: Option<Pixels>,
     /// Diff row + split half under the pointer where a hover "+" (new
     /// comment) affordance shows; None when the pointer isn't on a
-    /// commentable line of a PR item.
+    /// commentable line.
     hover_plus: Option<(usize, SelSide)>,
     composer: Option<Composer>,
     /// Bumped on every composer open/close; an in-flight post only reports
@@ -4636,14 +4760,14 @@ impl ReviewApp {
         cx.notify();
     }
 
-    /// `c`: show/hide the comment rows of the active PR item, keeping the
+    /// `c`: show/hide the comment rows of the active item, keeping the
     /// viewport anchored at the first visible diff row.
     fn toggle_comments(&mut self, cx: &mut Context<Self>) {
         let Some(data) = self.active_data_mut() else {
             return;
         };
         if data.comments.is_none() {
-            return; // Local item: no comment affordances.
+            return;
         }
         data.comments_visible = !data.comments_visible;
         data.rebuild_rows_anchored();
@@ -4651,8 +4775,8 @@ impl ReviewApp {
     }
 
     /// The row + split half under the pointer if it can take a new comment:
-    /// active item is a PR with a known head oid, the pointer is inside the
-    /// diff list, and the row has a line number on that side.
+    /// the pointer is inside the diff list, and the row has a line number on
+    /// that side. PR items also need a known head oid for GitHub anchoring.
     fn hover_target(
         &mut self,
         position: Point<Pixels>,
@@ -4663,20 +4787,19 @@ impl ReviewApp {
         }
         let char_width = self.char_width(window);
         let item = self.active_item()?;
-        let Source::Pr(_) = item.source else {
-            return None;
-        };
         let ItemState::Ready(data) = &item.state else {
             return None;
         };
         // New comments post against the head oid; without one (older gh
         // missing headRefOid) the affordance stays off entirely.
-        if data
-            .pr_meta
-            .as_ref()
-            .is_none_or(|meta| meta.head_ref_oid.is_empty())
-        {
-            return None;
+        if matches!(&item.source, Source::Pr(_)) {
+            if data
+                .pr_meta
+                .as_ref()
+                .is_none_or(|meta| meta.head_ref_oid.is_empty())
+            {
+                return None;
+            }
         }
         let bounds = data.scroll.0.borrow().base_handle.bounds();
         if !bounds.contains(&position) {
@@ -5050,8 +5173,11 @@ impl ReviewApp {
             .and_then(|data| data.pr_meta.as_ref())
             .map(|meta| meta.head_ref_oid.clone())
             .unwrap_or_default();
-        if reply_to.is_none() && commit_id.is_empty() {
-            return;
+        if reply_to.is_none() {
+            match &item.source {
+                Source::Pr(_) if commit_id.is_empty() => return,
+                Source::Pr(_) | Source::Local(_) => {}
+            }
         }
         self.composer_gen += 1;
         let input = cx.new(|cx| {
@@ -5093,9 +5219,8 @@ impl ReviewApp {
         }
     }
 
-    /// Post the composer's comment (or reply) via gh on the background
-    /// executor. Success closes the composer and refetches only the comments;
-    /// failure surfaces gh's stderr inline in the composer.
+    /// Submit the composer's comment (or reply): local items update in-memory
+    /// drafts immediately; PR items post via gh on the background executor.
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(composer) = &self.composer else {
             return;
@@ -5110,11 +5235,8 @@ impl ReviewApp {
         let Some(item) = self.items.iter().find(|item| item.id == composer.item_id) else {
             return;
         };
-        let Source::Pr(loc) = &item.source else {
-            return;
-        };
-        let loc = loc.clone();
         let item_id = item.id;
+        let source = item.source.clone();
         let gen = self.composer_gen;
         let (reply_to, commit_id, path, side, line) = {
             let composer = self.composer.as_mut().unwrap();
@@ -5127,6 +5249,16 @@ impl ReviewApp {
                 composer.side,
                 composer.line,
             )
+        };
+        if let Source::Local(_) = source {
+            self.add_local_comment(item_id, reply_to, path, side, line, body, cx);
+            if self.composer_gen == gen {
+                self.close_composer(window, cx);
+            }
+            return;
+        }
+        let Source::Pr(loc) = source else {
+            return;
         };
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
@@ -5167,6 +5299,47 @@ impl ReviewApp {
             .ok();
         })
         .detach();
+    }
+
+    fn add_local_comment(
+        &mut self,
+        item_id: u64,
+        reply_to: Option<u64>,
+        path: String,
+        side: CommentSide,
+        line: u64,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
+            return;
+        };
+        let ItemState::Ready(data) = &mut item.state else {
+            return;
+        };
+        let Some(local) = &mut data.local_review else {
+            return;
+        };
+        local.add_comment(reply_to, path, side, line, body);
+        data.comments = Some(local.index());
+        data.rebuild_rows_anchored();
+        cx.notify();
+    }
+
+    fn copy_local_review_prompt(&self, cx: &mut Context<Self>) {
+        let Some(item) = self.active_item() else {
+            return;
+        };
+        let Source::Local(src) = &item.source else {
+            return;
+        };
+        let ItemState::Ready(data) = &item.state else {
+            return;
+        };
+        let Some(local) = &data.local_review else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(local_review_prompt(src, local)));
     }
 
     /// Refetch only the review comments (not meta/patch), regroup, and
@@ -5885,18 +6058,17 @@ impl ReviewApp {
             return None;
         }
         let item = self.active_item()?;
-        let Source::Pr(_) = item.source else {
-            return None;
-        };
         let ItemState::Ready(data) = &item.state else {
             return None;
         };
-        if data
-            .pr_meta
-            .as_ref()
-            .is_none_or(|meta| meta.head_ref_oid.is_empty())
-        {
-            return None;
+        if matches!(&item.source, Source::Pr(_)) {
+            if data
+                .pr_meta
+                .as_ref()
+                .is_none_or(|meta| meta.head_ref_oid.is_empty())
+            {
+                return None;
+            }
         }
         let (anchor_side, line) = comment_anchor(&data.rows, row_ix, side)?;
         let file_ix = data
@@ -7292,6 +7464,11 @@ impl Render for ReviewApp {
                 // whose own secondary-enter handles submission.
                 if this.review.is_some() {
                     this.submit_review(window, cx);
+                } else if matches!(
+                    this.active_item().map(|item| &item.source),
+                    Some(Source::Local(_))
+                ) {
+                    this.copy_local_review_prompt(cx);
                 } else {
                     this.open_review(window, cx);
                 }
@@ -9077,6 +9254,70 @@ mod tests {
         assert!(header.contains("myrepo"));
         assert!(header.contains("feature"));
         assert!(header.contains("origin/main"));
+    }
+
+    #[test]
+    fn local_review_comments_index_like_review_threads() {
+        let mut review = LocalReview::default();
+        review.add_comment(
+            None,
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            12,
+            "please simplify this".to_string(),
+        );
+        review.add_comment(
+            Some(1),
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            12,
+            "also add a test".to_string(),
+        );
+
+        let index = review.index();
+        assert_eq!(index.counts["src/lib.rs"], (2, 0));
+        let threads = &index.threads["src/lib.rs"][&(CommentSide::Right, 12)];
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].root.body, "please simplify this");
+        assert_eq!(threads[0].replies[0].body, "also add a test");
+    }
+
+    #[test]
+    fn local_review_prompt_matches_difit_comment_format() {
+        let src = git::LocalSource {
+            repo_root: "/tmp/myrepo".into(),
+            branch: "feature".into(),
+            base_ref: None,
+            base_label: "upstream/main".into(),
+            base_oid: None,
+        };
+        let mut review = LocalReview::default();
+        review.add_comment(
+            None,
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            7,
+            "why remove this?\nplease explain".to_string(),
+        );
+        review.add_comment(
+            Some(1),
+            "src/lib.rs".to_string(),
+            CommentSide::Right,
+            7,
+            "because this path handles nil".to_string(),
+        );
+        review.add_comment(
+            None,
+            "src/main.rs".to_string(),
+            CommentSide::Left,
+            12,
+            "second thread".to_string(),
+        );
+
+        assert_eq!(
+            local_review_prompt(&src, &review),
+            "Diff: upstream/main ← feature. Locations are GitHub diff-style: path:Rline for right/new, path:Lline for left/old.\n\nsrc/lib.rs:R7\nwhy remove this?\nplease explain\nReply 1 (you)\nbecause this path handles nil\n=====\nsrc/main.rs:L12\nsecond thread"
+        );
     }
 
     #[test]
