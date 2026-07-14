@@ -2834,7 +2834,6 @@ fn local_titlebar_content(
     cx: &mut Context<ReviewApp>,
 ) -> gpui::AnyElement {
     let blue: Hsla = theme::blue().into();
-    let repo_root = src.repo_root.clone();
     div()
         .flex()
         .items_center()
@@ -2875,7 +2874,7 @@ fn local_titlebar_content(
                         .text_color(theme::overlay0())
                         .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.6)))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_local_base_palette(item_id, repo_root.clone(), window, cx);
+                            this.open_base_palette(item_id, window, cx);
                         }))
                         .child(SharedString::from(format!("{} ← {}", src.base_label, src.branch))),
                 )
@@ -2903,6 +2902,7 @@ fn local_titlebar_content(
 }
 
 fn remote_titlebar_content(
+    item_id: u64,
     src: &git::RemoteSource,
     data: &ItemData,
     cx: &mut Context<ReviewApp>,
@@ -2942,7 +2942,15 @@ fn remote_titlebar_content(
                 .pr_3()
                 .child(
                     div()
+                        .id("remote-base-picker")
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
                         .text_color(theme::overlay0())
+                        .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.6)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_base_palette(item_id, window, cx);
+                        }))
                         .child(SharedString::from(format!(
                             "{} ← {}",
                             src.base_label, src.branch
@@ -2972,6 +2980,12 @@ fn remote_titlebar_content(
 }
 
 /// The cmd-k command palette: a staged flow for opening things.
+#[derive(Clone)]
+enum BaseListTarget {
+    Local(PathBuf),
+    Remote(git::RemoteSource),
+}
+
 enum PaletteStep {
     /// Step 1: pick what to open.
     Sources { selected: usize },
@@ -2986,10 +3000,10 @@ enum PaletteStep {
         profile: git::SshProfile,
         error: Option<SharedString>,
     },
-    /// Local path: pick the base ref for an already-open local item.
+    /// Pick the base ref for an already-open local or remote item.
     LocalBaseList {
         item_id: u64,
-        repo_root: PathBuf,
+        target: BaseListTarget,
         current: String,
         bases: BaseListState,
     },
@@ -4608,28 +4622,27 @@ impl ReviewApp {
         .detach();
     }
 
-    fn open_local_base_palette(
-        &mut self,
-        item_id: u64,
-        repo_root: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| match &item.source {
-                Source::Local(src) => Some(src.base_label.clone()),
-                Source::Remote(src) => Some(src.base_label.clone()),
-                Source::Pr(_) => None,
-            })
-            .unwrap_or_else(|| "HEAD".to_string());
+    fn open_base_palette(&mut self, item_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.items.iter().find(|item| item.id == item_id) else {
+            return;
+        };
+        let (current, target) = match &item.source {
+            Source::Local(src) => (
+                src.base_label.clone(),
+                BaseListTarget::Local(src.repo_root.clone()),
+            ),
+            Source::Remote(src) => (
+                src.base_label.clone(),
+                BaseListTarget::Remote(src.clone()),
+            ),
+            Source::Pr(_) => return,
+        };
+        let fetch_target = target.clone();
         self.palette_gen += 1;
         let gen = self.palette_gen;
         self.palette = Some(PaletteStep::LocalBaseList {
             item_id,
-            repo_root: repo_root.clone(),
+            target,
             current,
             bases: BaseListState::Loading,
         });
@@ -4637,7 +4650,12 @@ impl ReviewApp {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let fetched = cx
-                .background_spawn(async move { git::list_base_refs(&repo_root) })
+                .background_spawn(async move {
+                    match fetch_target {
+                        BaseListTarget::Local(repo_root) => git::list_base_refs(&repo_root),
+                        BaseListTarget::Remote(src) => git::list_remote_base_refs(&src),
+                    }
+                })
                 .await;
             this.update(cx, |app, cx| {
                 if app.palette_gen != gen {
@@ -4693,7 +4711,7 @@ impl ReviewApp {
     fn palette_open_base_row(&mut self, pos: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(PaletteStep::LocalBaseList {
             item_id,
-            repo_root,
+            target,
             bases: BaseListState::Loaded { all, filtered, .. },
             ..
         }) = &self.palette
@@ -4703,7 +4721,7 @@ impl ReviewApp {
         let Some(&ix) = filtered.get(pos) else {
             return;
         };
-        let (item_id, repo_root, base_ref) = (*item_id, repo_root.clone(), all[ix].clone());
+        let (item_id, target, base_ref) = (*item_id, target.clone(), all[ix].clone());
         self.close_palette(window, cx);
         let Some(item) = self.items.iter_mut().find(|item| item.id == item_id) else {
             return;
@@ -4712,18 +4730,27 @@ impl ReviewApp {
             ItemState::Ready(data) => data.mode,
             _ => ViewMode::Split,
         };
-        let branch = match &item.source {
-            Source::Local(src) => src.branch.clone(),
-            Source::Remote(src) => src.branch.clone(),
-            Source::Pr(_) => dir_name(&repo_root),
+        let source = match target {
+            BaseListTarget::Local(repo_root) => {
+                let branch = match &item.source {
+                    Source::Local(src) => src.branch.clone(),
+                    Source::Remote(_) | Source::Pr(_) => dir_name(&repo_root),
+                };
+                Source::Local(git::LocalSource {
+                    repo_root,
+                    branch,
+                    base_ref: Some(base_ref.clone()),
+                    base_label: base_ref,
+                    base_oid: None,
+                })
+            }
+            BaseListTarget::Remote(mut src) => {
+                src.base_ref = Some(base_ref.clone());
+                src.base_label = base_ref;
+                src.base_oid = None;
+                Source::Remote(src)
+            }
         };
-        let source = Source::Local(git::LocalSource {
-            repo_root,
-            branch,
-            base_ref: Some(base_ref.clone()),
-            base_label: base_ref,
-            base_oid: None,
-        });
         item.source = source.clone();
         item.refresh_error = None;
         match item.state {
@@ -6683,7 +6710,7 @@ impl ReviewApp {
                         None => app_title(None),
                     },
                     Source::Local(src) => local_titlebar_content(item.id, src, data, cx),
-                    Source::Remote(src) => remote_titlebar_content(src, data, cx),
+                    Source::Remote(src) => remote_titlebar_content(item.id, src, data, cx),
                 },
                 ItemState::Loading => app_title(Some(format!("loading {}…", item.primary()))),
                 ItemState::Failed(_) => app_title(Some(format!("{} — failed", item.primary()))),

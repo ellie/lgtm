@@ -548,19 +548,7 @@ pub fn list_remote_base_refs(src: &RemoteSource) -> Result<Vec<String>> {
         }
         push_unique(&mut candidates, candidate.to_string());
     }
-    Ok(candidates
-        .into_iter()
-        .filter(|candidate| {
-            candidate == "HEAD"
-                || remote_git(
-                    &src.connections,
-                    &src.profile,
-                    &repo_root,
-                    &["merge-base", "HEAD", candidate],
-                )
-                .is_ok()
-        })
-        .collect())
+    Ok(candidates)
 }
 
 pub fn remote_diff_patch(src: &RemoteSource) -> Result<String> {
