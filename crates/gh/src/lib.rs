@@ -202,6 +202,89 @@ pub fn fetch_review_comments(loc: &PrLocator) -> Result<Vec<ReviewComment>> {
     Ok(pages.into_iter().flatten().collect())
 }
 
+/// A user who can be @-mentioned on this repo, for comment autocomplete.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Mention {
+    pub login: String,
+    /// The user's display name, if set (shown as a hint beside the login).
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Never page past this many mentionable users; big repos can have thousands,
+/// and the autocomplete only needs a workable pool of the most relevant.
+const MAX_MENTIONABLE: usize = 500;
+
+/// Users who can be @-mentioned on the PR's repo, via the GraphQL
+/// `mentionableUsers` connection (the same set GitHub's own comment box
+/// autocompletes from). Paginated up to `MAX_MENTIONABLE`.
+pub fn fetch_mentionable_users(loc: &PrLocator) -> Result<Vec<Mention>> {
+    #[derive(serde::Deserialize)]
+    struct Resp {
+        data: Data,
+    }
+    #[derive(serde::Deserialize)]
+    struct Data {
+        repository: RepositoryField,
+    }
+    #[derive(serde::Deserialize)]
+    struct RepositoryField {
+        #[serde(rename = "mentionableUsers")]
+        mentionable_users: Connection,
+    }
+    #[derive(serde::Deserialize)]
+    struct Connection {
+        nodes: Vec<Mention>,
+        #[serde(rename = "pageInfo")]
+        page_info: PageInfo,
+    }
+    #[derive(serde::Deserialize)]
+    struct PageInfo {
+        #[serde(rename = "hasNextPage")]
+        has_next_page: bool,
+        #[serde(rename = "endCursor")]
+        end_cursor: Option<String>,
+    }
+
+    const QUERY: &str = "query($owner:String!,$repo:String!,$after:String){\
+        repository(owner:$owner,name:$repo){\
+        mentionableUsers(first:100,after:$after){\
+        nodes{login name} pageInfo{hasNextPage endCursor}}}}";
+
+    let mut users = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".to_string(),
+            "-f".to_string(),
+            format!("query={QUERY}"),
+            "-f".to_string(),
+            format!("owner={}", loc.owner),
+            "-f".to_string(),
+            format!("repo={}", loc.repo),
+        ];
+        if let Some(after) = &cursor {
+            args.push("-f".to_string());
+            args.push(format!("after={after}"));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let json = gh(&arg_refs)?;
+        let resp: Resp =
+            serde_json::from_str(&json).context("unexpected gh graphql mentionableUsers JSON")?;
+        let conn = resp.data.repository.mentionable_users;
+        users.extend(conn.nodes);
+        if users.len() >= MAX_MENTIONABLE || !conn.page_info.has_next_page {
+            break;
+        }
+        match conn.page_info.end_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Ok(users)
+}
+
 /// Post a new top-level review comment anchored at (path, side, line) against
 /// `commit_id` (the PR's head oid). Errors carry gh's stderr — a 403 usually
 /// means a missing token scope, a 422 an unanchorable line.
