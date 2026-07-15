@@ -4381,6 +4381,7 @@ dependencies = [
  "gpui-component",
  "gpui-component-assets",
  "libc",
+ "lsp-types",
  "serde_json",
  "syntax",
 ]

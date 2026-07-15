@@ -9,16 +9,16 @@ use gpui::{
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
-    SharedString, StyledText, Subscription, TextRun, TitlebarOptions, UniformListScrollHandle,
+    SharedString, StyledText, Subscription, Task, TextRun, TitlebarOptions, UniformListScrollHandle,
     Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
-    input::{Escape as InputEscape, Input, InputEvent, InputState},
+    input::{CompletionProvider, Escape as InputEscape, Input, InputEvent, InputState},
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Disableable as _, IconName, Root, Sizable as _, TitleBar,
+    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -2172,6 +2172,12 @@ struct ItemData {
     local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
+    /// Users offered by the composer's `@`-mention autocomplete. Shared live
+    /// with any open `MentionProvider`; seeded from PR participants, then
+    /// filled from the repo's mentionable set (see `mentions_fetched`).
+    mentions: Rc<RefCell<Vec<gh::Mention>>>,
+    /// The one-time background mentionable-user fetch has been kicked off.
+    mentions_fetched: bool,
     /// Sidebar file tree, rebuilt whenever the diff itself changes (load,
     /// refresh, blob upgrade) — but not on view-mode toggles: entries map to
     /// file indices, not row indices, so they survive row rebuilds.
@@ -2409,6 +2415,8 @@ impl ReviewItem {
                     comments,
                     local_review,
                     comments_visible: true,
+                    mentions: Rc::new(RefCell::new(Vec::new())),
+                    mentions_fetched: false,
                     tree: Vec::new(),
                     collapsed: HashSet::new(),
                     tree_scroll: UniformListScrollHandle::new(),
@@ -3042,6 +3050,153 @@ fn parse_repo_slug(value: &str) -> Result<(String, String), &'static str> {
         return Err("expected owner/repo");
     }
     Ok((owner.to_string(), repo.to_string()))
+}
+
+// --- @-mention autocomplete ------------------------------------------------
+
+/// Most completion items to offer at once.
+const MENTION_LIMIT: usize = 50;
+
+/// `@`-mention autocomplete for the comment composer, backed by the item's
+/// shared, live-updating pool of mentionable users (seeded with PR
+/// participants, then filled from the repo's mentionable set in the
+/// background). Reads the pool fresh on every keystroke.
+struct MentionProvider {
+    users: Rc<RefCell<Vec<gh::Mention>>>,
+}
+
+/// If the cursor sits inside an `@mention` token, return the byte offset of the
+/// `@` and the (possibly empty) login text typed after it. The `@` must begin a
+/// word — preceded by whitespace or the start of the text — matching GitHub's
+/// own mention rules, so `foo@bar` never triggers.
+fn mention_prefix(text: &Rope, offset: usize) -> Option<(usize, String)> {
+    let s = text.to_string();
+    let offset = offset.min(s.len());
+    let before = &s[..offset];
+    // GitHub logins are alphanumeric plus hyphen; walk back over that run.
+    let start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| c.is_ascii_alphanumeric() || *c == '-')
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(offset);
+    if start == 0 || before.as_bytes()[start - 1] != b'@' {
+        return None;
+    }
+    let at = start - 1;
+    if at > 0 && !before[..at].chars().next_back().unwrap().is_whitespace() {
+        return None;
+    }
+    Some((at, before[start..offset].to_string()))
+}
+
+/// Rank of `user` against `query` (matched case-insensitively), lower = better;
+/// None = no match. Login prefix beats name prefix beats substring matches.
+fn mention_rank(user: &gh::Mention, query: &str) -> Option<u8> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let query = &query.to_ascii_lowercase();
+    let login = user.login.to_ascii_lowercase();
+    let name = user.name.as_ref().map(|n| n.to_ascii_lowercase());
+    if login.starts_with(query) {
+        Some(0)
+    } else if name
+        .as_deref()
+        .is_some_and(|n| n.split_whitespace().any(|w| w.starts_with(query)))
+    {
+        Some(1)
+    } else if login.contains(query) {
+        Some(2)
+    } else if name.as_deref().is_some_and(|n| n.contains(query)) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+impl CompletionProvider for MentionProvider {
+    fn completions(
+        &self,
+        text: &Rope,
+        offset: usize,
+        _trigger: lsp_types::CompletionContext,
+        _window: &mut Window,
+        _cx: &mut Context<InputState>,
+    ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
+        let empty = Task::ready(Ok(lsp_types::CompletionResponse::Array(vec![])));
+        let Some((at, prefix)) = mention_prefix(text, offset) else {
+            return empty;
+        };
+        // The edit replaces `@prefix` (the token so far) with `@login `.
+        let range = lsp_types::Range {
+            start: text.offset_to_position(at),
+            end: text.offset_to_position(offset),
+        };
+        let users = self.users.borrow();
+        let mut ranked: Vec<(u8, &gh::Mention)> = users
+            .iter()
+            .filter_map(|u| mention_rank(u, &prefix).map(|r| (r, u)))
+            .collect();
+        // Stable sort keeps GitHub's alphabetical order within each rank.
+        ranked.sort_by_key(|(rank, _)| *rank);
+        let items = ranked
+            .into_iter()
+            .take(MENTION_LIMIT)
+            .map(|(_, u)| lsp_types::CompletionItem {
+                label: u.login.clone(),
+                filter_text: Some(u.login.clone()),
+                detail: u.name.clone(),
+                text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                    range,
+                    new_text: format!("@{} ", u.login),
+                })),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        Task::ready(Ok(lsp_types::CompletionResponse::Array(items)))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _offset: usize,
+        _new_text: &str,
+        _cx: &mut Context<InputState>,
+    ) -> bool {
+        // Cheap to always run; `completions` returns nothing outside a mention.
+        true
+    }
+}
+
+/// Seed `cell` with everyone already visible on the PR — the author and every
+/// comment author — so autocomplete has relevant names before the full
+/// mentionable-user fetch returns. Additive: never drops fetched entries.
+fn seed_mentions(cell: &Rc<RefCell<Vec<gh::Mention>>>, data: &ItemData) {
+    let mut pool = cell.borrow_mut();
+    let mut add = |login: &str| {
+        if !login.is_empty() && !pool.iter().any(|m| m.login.eq_ignore_ascii_case(login)) {
+            pool.push(gh::Mention {
+                login: login.to_string(),
+                name: None,
+            });
+        }
+    };
+    if let Some(meta) = &data.pr_meta {
+        add(&meta.author.login);
+    }
+    if let Some(index) = &data.comments {
+        for anchors in index.threads.values() {
+            for threads in anchors.values() {
+                for thread in threads {
+                    add(&thread.root.user.login);
+                    for reply in &thread.replies {
+                        add(&reply.user.login);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The floating comment/reply composer. One at a time, targeting a specific
@@ -5168,6 +5323,10 @@ impl ReviewApp {
             return;
         };
         let item_id = item.id;
+        let pr_loc = match &item.source {
+            Source::Pr(loc) => Some(loc.clone()),
+            Source::Local(_) => None,
+        };
         let commit_id = self
             .active_data()
             .and_then(|data| data.pr_meta.as_ref())
@@ -5195,6 +5354,18 @@ impl ReviewApp {
                 }
             });
         input.update(cx, |state, cx| state.focus(window, cx));
+        // Wire up @-mention autocomplete for PR items: seed the pool with known
+        // participants now, attach the provider, then fetch the full list once.
+        if let Some(loc) = pr_loc {
+            if let Some(data) = self.active_data() {
+                let mentions = data.mentions.clone();
+                seed_mentions(&mentions, data);
+                input.update(cx, |state, _| {
+                    state.lsp.completion_provider = Some(Rc::new(MentionProvider { users: mentions }));
+                });
+            }
+            self.ensure_mentions(item_id, loc, cx);
+        }
         self.composer = Some(Composer {
             item_id,
             reply_to,
@@ -5209,6 +5380,51 @@ impl ReviewApp {
             _subscription,
         });
         cx.notify();
+    }
+
+    /// Fetch the repo's mentionable users once per item, merging them into the
+    /// item's shared mention pool (which an open composer's completion provider
+    /// reads live). Best-effort: on failure the seeded participants remain.
+    fn ensure_mentions(&mut self, item_id: u64, loc: gh::PrLocator, cx: &mut Context<Self>) {
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        if data.mentions_fetched {
+            return;
+        }
+        data.mentions_fetched = true;
+        cx.spawn(async move |this, cx| {
+            let fetched = cx
+                .background_spawn(async move { gh::fetch_mentionable_users(&loc) })
+                .await;
+            let Ok(users) = fetched else {
+                return;
+            };
+            this.update(cx, |app, cx| {
+                let Some(item) = app.items.iter().find(|item| item.id == item_id) else {
+                    return;
+                };
+                let ItemState::Ready(data) = &item.state else {
+                    return;
+                };
+                let mut pool = data.mentions.borrow_mut();
+                for user in users {
+                    match pool
+                        .iter_mut()
+                        .find(|m| m.login.eq_ignore_ascii_case(&user.login))
+                    {
+                        // Upgrade a seeded (name-less) participant in place.
+                        Some(existing) if existing.name.is_none() => existing.name = user.name,
+                        Some(_) => {}
+                        None => pool.push(user),
+                    }
+                }
+                drop(pool);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn close_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7629,6 +7845,48 @@ impl Render for ReviewApp {
 mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
+
+    fn mention(login: &str, name: Option<&str>) -> gh::Mention {
+        gh::Mention {
+            login: login.to_string(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn mention_prefix_detects_at_tokens_at_word_boundaries() {
+        let at = |s: &str, off: usize| mention_prefix(&Rope::from(s), off);
+        // Bare `@` with the cursor right after it: empty prefix.
+        assert_eq!(at("hi @", 4), Some((3, String::new())));
+        // Mid-token cursor returns only what's typed so far.
+        assert_eq!(at("hi @oct", 7), Some((3, "oct".to_string())));
+        assert_eq!(at("hi @oct", 5), Some((3, "o".to_string())));
+        // Start of text counts as a boundary.
+        assert_eq!(at("@oct", 4), Some((0, "oct".to_string())));
+        // Hyphens are valid login characters.
+        assert_eq!(at("@foo-bar", 8), Some((0, "foo-bar".to_string())));
+        // Not a boundary (looks like an email) — no completion.
+        assert_eq!(at("foo@bar", 7), None);
+        // No `@` at all.
+        assert_eq!(at("hello", 5), None);
+        // Cursor before the `@`.
+        assert_eq!(at("hi @oct", 3), None);
+    }
+
+    #[test]
+    fn mention_rank_orders_login_prefix_first() {
+        let octocat = mention("octocat", Some("The Octocat"));
+        // Login prefix is the strongest match.
+        assert_eq!(mention_rank(&octocat, "oct"), Some(0));
+        // Empty query matches everything at the top rank.
+        assert_eq!(mention_rank(&octocat, ""), Some(0));
+        // Name-word prefix beats a login substring.
+        assert_eq!(mention_rank(&mention("xyz", Some("Bob Jones")), "bob"), Some(1));
+        assert_eq!(mention_rank(&mention("abobc", None), "bob"), Some(2));
+        // Case-insensitive, and no match returns None.
+        assert_eq!(mention_rank(&octocat, "OCT"), Some(0));
+        assert_eq!(mention_rank(&octocat, "zzz"), None);
+    }
 
     #[test]
     fn identifier_hover_hit_snaps_to_the_token_start() {

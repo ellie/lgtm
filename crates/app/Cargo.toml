@@ -18,6 +18,8 @@ syntax = { path = "../syntax" }
 gpui = "0.2"
 gpui-component = "0.5"
 gpui-component-assets = "0.5"
+# Must match gpui-component's lsp-types so its CompletionProvider signatures line up.
+lsp-types = "0.97"
 fuzzy-matcher = "0.3"
 serde_json = { workspace = true }
 libc = "0.2"
