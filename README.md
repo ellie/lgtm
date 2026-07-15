@@ -24,6 +24,15 @@ Or build from source:
 cargo run --release
 ```
 
+Note that you will need Xcode to build it from source because the metal dev
+tools are bundled with it. Otherwise the build fails with the following error:
+
+```
+cargo:rerun-if-changed=./src/platform/mac/shaders.metal
+cargo::error=metal shader compilation failed:
+xcrun: error: unable to find utility "metal", not a developer tool or in PATH
+```
+
 ## Features
 - unified + split views
 - tree-sitter highlighting (18 languages),
