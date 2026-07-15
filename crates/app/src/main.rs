@@ -5,7 +5,8 @@ use anyhow::{anyhow, bail, Context as _};
 use diff_core::{diff_texts, DiffRow, FileDiff, FileStatus, Hunk, PrDiff};
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use gpui::{
-    actions, canvas, div, fill, font, point, prelude::*, px, relative, size, uniform_list, App,
+    actions, anchored, canvas, deferred, div, fill, font, point, prelude::*, px, relative, size,
+    uniform_list, App,
     Application, Bounds, ClipboardItem, Context, FocusHandle, HighlightStyle, Hsla, KeyBinding,
     Keystroke, ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PathPromptOptions, Pixels, Point, ScrollHandle, ScrollStrategy, ScrollWheelEvent,
@@ -18,7 +19,8 @@ use gpui_component::{
     kbd::Kbd,
     scroll::Scrollbar,
     tag::Tag,
-    Disableable as _, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
+    tooltip::Tooltip,
+    Disableable as _, Icon, IconName, Root, Rope, RopeExt as _, Sizable as _, TitleBar,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -32,7 +34,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use lsp_client::{
-    trace as lsp_trace, DefinitionTarget, HoverResult, LspPosition, LspProgress, LspSession,
+    trace as lsp_trace, DefinitionTarget, HoverResult, LspBackend, LspPosition, LspProgress,
+    LspSession,
 };
 
 const MONO: &str = "Menlo";
@@ -658,6 +661,9 @@ fn selection_text(sel: &Selection, rows: &[Row]) -> String {
 const MAX_HUNK_SOURCE_BYTES: usize = 100 * 1024;
 /// Individual lines longer than this stay plain even in a highlighted hunk.
 const MAX_SYNTAX_LINE_BYTES: usize = 4096;
+/// Whole files above this stay plain in the go-to-definition source view
+/// (highlighting runs synchronously when the view opens).
+const MAX_SOURCE_HIGHLIGHT_BYTES: usize = 512 * 1024;
 
 /// Patch-only highlighting: we have no full files, so highlight each hunk's
 /// text standalone, per side — old_source is context+removed lines, new_source
@@ -2194,6 +2200,10 @@ struct ItemData {
     lsp_progress: Option<Arc<Mutex<LspProgress>>>,
     lsp_loading: bool,
     lsp_error: Option<SharedString>,
+    /// Which server backs this item's hover/goto; the "LSP" status chip toggles
+    /// it (Bifrost ↔ rust-analyzer) and restarts the session. Per-item so a
+    /// buildable Rust review can use rust-analyzer without affecting others.
+    lsp_backend: LspBackend,
     hover: Option<HoverState>,
     hover_gen: u64,
     hover_cancel: Option<Arc<AtomicBool>>,
@@ -2425,6 +2435,7 @@ impl ReviewItem {
                     lsp_progress: None,
                     lsp_loading: false,
                     lsp_error: None,
+                    lsp_backend: LspBackend::default(),
                     hover: None,
                     hover_gen: 0,
                     hover_cancel: None,
@@ -3691,6 +3702,9 @@ struct HoverState {
 struct SourceViewState {
     target: DefinitionTarget,
     lines: Vec<SharedString>,
+    /// Tree-sitter spans per line (line-relative byte ranges), index-aligned
+    /// with `lines`; empty when the language is unknown or the file is too big.
+    syntax: Vec<Vec<(Range<usize>, syntax::Token)>>,
     scroll: UniformListScrollHandle,
 }
 
@@ -3721,6 +3735,17 @@ fn identifier_start_at(text: &str, col: usize) -> Option<usize> {
         cursor -= 1;
     }
     Some(cursor)
+}
+
+/// Short status for a still-loading LSP. A real sub-100% percentage is genuine
+/// indexing progress and worth showing; at 100% (or once the phase count is
+/// gone) the server is usually still analyzing before hovers resolve — so show
+/// "analyzing…" rather than a stuck "100%".
+fn lsp_loading_label(percentage: Option<u32>) -> String {
+    match percentage {
+        Some(pct) if pct < 100 => format!("{pct}%"),
+        _ => "analyzing…".to_string(),
+    }
 }
 
 fn lsp_warmup_position(data: &ItemData) -> Option<LspPosition> {
@@ -4176,6 +4201,21 @@ impl ReviewApp {
         .detach();
     }
 
+    /// Switch the active item's LSP backend (Bifrost ↔ rust-analyzer) and
+    /// restart its session. Driven by clicking the "LSP" status chip.
+    fn toggle_lsp_backend(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.items.get(self.active) else {
+            return;
+        };
+        let id = item.id;
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        data.lsp_backend = data.lsp_backend.toggled();
+        self.restart_lsp_for_item(id, cx);
+        cx.notify();
+    }
+
     fn restart_lsp_for_item(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
             return;
@@ -4185,12 +4225,13 @@ impl ReviewApp {
         };
         item.lsp_gen += 1;
         let gen = item.lsp_gen;
+        let backend = data.lsp_backend;
         data.lsp = None;
         data.lsp_error = None;
         data.lsp_loading = true;
         let progress = Arc::new(Mutex::new(LspProgress {
             title: Some("Indexing workspace".to_string()),
-            message: Some("Starting Bifrost".to_string()),
+            message: Some(format!("Starting {}", backend.label())),
             percentage: Some(0),
             done: false,
         }));
@@ -4208,8 +4249,12 @@ impl ReviewApp {
             let result = cx
                 .background_spawn(async move {
                     let root = lsp_root_for_source(&source, pr_meta.as_ref())?;
-                    let session =
-                        LspSession::start(root.clone(), Arc::clone(&progress_for_start), warmup)?;
+                    let session = LspSession::start(
+                        root.clone(),
+                        backend,
+                        Arc::clone(&progress_for_start),
+                        warmup,
+                    )?;
                     Ok::<LspHandle, anyhow::Error>(LspHandle {
                         root,
                         session,
@@ -5205,8 +5250,8 @@ impl ReviewApp {
         push_history: bool,
         cx: &mut Context<Self>,
     ) {
-        let lines = match self.read_lsp_source_lines(&target) {
-            Ok(lines) => lines,
+        let (lines, syntax) = match self.read_lsp_source_lines(&target) {
+            Ok(loaded) => loaded,
             Err(err) => {
                 lsp_trace(format_args!("ui definition source error: {err:#}"));
                 return;
@@ -5230,6 +5275,7 @@ impl ReviewApp {
             data.source_view = Some(SourceViewState {
                 target,
                 lines,
+                syntax,
                 scroll,
             });
             data.hover = None;
@@ -5237,19 +5283,38 @@ impl ReviewApp {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn read_lsp_source_lines(
         &self,
         target: &DefinitionTarget,
-    ) -> anyhow::Result<Vec<SharedString>> {
+    ) -> anyhow::Result<(
+        Vec<SharedString>,
+        Vec<Vec<(Range<usize>, syntax::Token)>>,
+    )> {
         let data = self.active_data().context("no active item")?;
         let handle = data.lsp.as_ref().context("LSP is not ready")?;
-        let path = handle.root.join(&target.path);
+        // Targets outside the workspace (dependency / stdlib sources) carry an
+        // absolute path; in-repo ones are relative to the LSP root.
+        let target_path = Path::new(&target.path);
+        let path = if target_path.is_absolute() {
+            target_path.to_path_buf()
+        } else {
+            handle.root.join(target_path)
+        };
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        Ok(text
+        let lines = text
             .lines()
             .map(|line| SharedString::from(line.to_string()))
-            .collect())
+            .collect();
+        // Tree-sitter highlighting keyed off the file's extension, guarded on
+        // total size (this runs synchronously when the view opens). Line-
+        // relative spans, index-aligned with `lines`.
+        let syntax = syntax::language_for_path(&target.path)
+            .filter(|_| text.len() <= MAX_SOURCE_HIGHLIGHT_BYTES)
+            .map(|lang| syntax::highlight_lines(lang, &text))
+            .unwrap_or_default();
+        Ok((lines, syntax))
     }
 
     fn current_nav_location(&self) -> Option<NavLocation> {
@@ -6714,7 +6779,7 @@ impl ReviewApp {
         TitleBar::new()
             .text_size(px(13.))
             .child(content)
-            .when_some(self.render_lsp_status(), |bar, status| bar.child(status))
+            .when_some(self.render_lsp_status(cx), |bar, status| bar.child(status))
             .when_some(note, |bar, note| {
                 bar.child(
                     div()
@@ -7251,40 +7316,58 @@ impl ReviewApp {
             .into_any_element()
     }
 
-    fn render_lsp_status(&self) -> Option<gpui::AnyElement> {
+    fn render_lsp_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let data = self.active_data()?;
-        let (text, color) = if let Some(err) = &data.lsp_error {
-            (
-                SharedString::from(format!("LSP: error - {err}")),
-                theme::red(),
-            )
-        } else if data.lsp_progress.is_some() {
-            let progress = data
+        let backend = data.lsp_backend;
+        // The chip always shows the active backend (so it reads as a control);
+        // a status suffix reflects loading/error, and the color tracks it.
+        let (suffix, color) = if let Some(err) = &data.lsp_error {
+            (format!(" · error: {err}"), theme::red())
+        } else if data.lsp_loading {
+            let percentage = data
                 .lsp_progress
                 .as_ref()
                 .and_then(|progress| progress.lock().ok().map(|progress| progress.clone()))
-                .unwrap_or_default();
-            let percentage = progress.percentage.unwrap_or(0);
-            (
-                SharedString::from(format!("LSP: {percentage}%")),
-                theme::blue(),
-            )
-        } else if data.lsp_loading {
-            (SharedString::from("LSP: 0%"), theme::blue())
+                .and_then(|progress| progress.percentage);
+            (format!(" · {}", lsp_loading_label(percentage)), theme::blue())
         } else {
-            return None;
+            (String::new(), theme::overlay0())
         };
+        let text = SharedString::from(format!("LSP: {}{suffix}", backend.label()));
+        let other = backend.toggled().label();
         Some(
             div()
+                .id("lsp-backend-toggle")
                 .flex_shrink_0()
-                .px_2()
+                // Keep the chip off the window's right edge (it's the rightmost
+                // titlebar element when there's no refresh note).
+                .mr_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .pl_2()
+                .pr_1()
                 .rounded_sm()
                 .border_1()
                 .border_color(Hsla::from(color).opacity(0.45))
                 .bg(Hsla::from(color).opacity(0.1))
                 .text_size(px(11.))
                 .text_color(color)
+                .cursor_pointer()
+                // Stronger border + fill on hover so it reads as a button.
+                .hover(|style| {
+                    style
+                        .bg(Hsla::from(color).opacity(0.2))
+                        .border_color(Hsla::from(color).opacity(0.8))
+                })
+                .tooltip(move |window, cx| {
+                    Tooltip::new(format!("Switch LSP to {other}")).build(window, cx)
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_lsp_backend(cx)))
                 .child(text)
+                // The caret signals it's a switchable control (like a dropdown);
+                // the Icon inherits the chip's text color.
+                .child(Icon::new(IconName::ChevronDown).xsmall())
                 .into_any_element(),
         )
     }
@@ -7301,43 +7384,55 @@ impl ReviewApp {
             let percentage = data
                 .lsp_progress
                 .as_ref()
-                .and_then(|progress| progress.lock().ok()?.percentage)
-                .unwrap_or(0);
-            SharedString::from(format!("LSP: {percentage}%"))
+                .and_then(|progress| progress.lock().ok()?.percentage);
+            SharedString::from(format!("LSP: {}", lsp_loading_label(percentage)))
         } else {
             SharedString::from(hover.result.as_ref()?.text.clone())
         };
+        // Anchor just below-right of the cursor; `anchored().snap_to_window`
+        // measures the card and slides it back from the window edges so it never
+        // spills off-screen and clips its own content. `deferred` paints it above
+        // everything and outside any ancestor's clip rect.
         Some(
-            div()
-                .absolute()
-                .left(hover.mouse.x + px(14.))
-                .top(hover.mouse.y + px(18.))
-                .max_w(px(520.))
-                .max_h(px(260.))
-                .overflow_hidden()
-                .rounded_sm()
-                .border_1()
-                .border_color(theme::surface0())
-                .bg(theme::mantle())
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .font_family(MONO)
-                .text_size(px(12.))
-                .line_height(px(18.))
-                .text_color(theme::text())
-                .child(div().p_3().child(text))
-                .child(
-                    div()
-                        .border_t_1()
-                        .border_color(theme::surface0())
-                        .px_3()
-                        .py_1()
-                        .text_size(px(10.))
-                        .text_color(theme::overlay0())
-                        .child(definition_hint),
-                )
-                .into_any_element(),
+            deferred(
+                anchored()
+                    .snap_to_window_with_margin(px(8.))
+                    .position(hover.mouse)
+                    .offset(point(px(14.), px(18.)))
+                    .child(
+                        div()
+                            .max_w(px(520.))
+                            .max_h(px(260.))
+                            .overflow_hidden()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(theme::surface0())
+                            .bg(theme::mantle())
+                            .shadow_lg()
+                            .flex()
+                            .flex_col()
+                            .font_family(MONO)
+                            .text_size(px(12.))
+                            .line_height(px(18.))
+                            .text_color(theme::text())
+                            // The body clips within the card's max height; the
+                            // hint stays pinned so it's never pushed off the
+                            // bottom by a long rust-analyzer hover.
+                            .child(div().p_3().min_h_0().overflow_hidden().child(text))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .border_t_1()
+                                    .border_color(theme::surface0())
+                                    .px_3()
+                                    .py_1()
+                                    .text_size(px(10.))
+                                    .text_color(theme::overlay0())
+                                    .child(definition_hint),
+                            ),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 
@@ -7347,6 +7442,7 @@ impl ReviewApp {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let lines = source.lines.clone();
+        let syntax = source.syntax.clone();
         let target = source.target.clone();
         let can_back = self
             .active_data()
@@ -7419,7 +7515,15 @@ impl ReviewApp {
                                 div()
                                     .whitespace_nowrap()
                                     .text_color(theme::text())
-                                    .child(lines[ix].clone()),
+                                    .child({
+                                        // Long lines stay plain, like the diff.
+                                        let spans = if lines[ix].len() > MAX_SYNTAX_LINE_BYTES {
+                                            &[][..]
+                                        } else {
+                                            syntax.get(ix).map(Vec::as_slice).unwrap_or(&[])
+                                        };
+                                        line_content(&lines[ix], spans, &[], None, None)
+                                    }),
                             )
                             .into_any_element()
                         })

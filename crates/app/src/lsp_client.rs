@@ -12,6 +12,46 @@ use std::time::Duration;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+/// Budget for the extra `textDocument/definition` lookup that decides whether a
+/// hover sits on its own declaration. Kept short so it can't stall (or, on
+/// timeout, discard) a hover that already resolved.
+const SUPPRESSION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait for rust-analyzer to finish loading + indexing during
+/// warmup before giving up and letting hovers resolve lazily. Bounded so a huge
+/// project (or an unresolvable warmup symbol) can't hang session startup.
+const RA_WARMUP_DEADLINE: Duration = Duration::from_secs(90);
+
+/// Which language server backs hover / go-to-definition. Bifrost (embedded,
+/// tree-sitter, build-free) is the default and works on any repo, including
+/// unbuilt PR worktrees, but only resolves symbols lexically. rust-analyzer
+/// adds real type inference — so method calls (`x.unwrap()`) and std/dep
+/// symbols resolve — at the cost of needing a buildable Rust project.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LspBackend {
+    #[default]
+    Bifrost,
+    RustAnalyzer,
+}
+
+impl LspBackend {
+    /// Short name for the status chip.
+    pub fn label(self) -> &'static str {
+        match self {
+            LspBackend::Bifrost => "Bifrost",
+            LspBackend::RustAnalyzer => "rust-analyzer",
+        }
+    }
+
+    /// The other backend, for the click-to-switch toggle.
+    pub fn toggled(self) -> Self {
+        match self {
+            LspBackend::Bifrost => LspBackend::RustAnalyzer,
+            LspBackend::RustAnalyzer => LspBackend::Bifrost,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LspPosition {
     pub path: String,
@@ -35,11 +75,18 @@ pub struct HoverResult {
 
 pub struct LspClient {
     root: PathBuf,
+    backend: LspBackend,
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
     progress: Arc<Mutex<LspProgress>>,
+    /// Files already sent via `textDocument/didOpen` (rust-analyzer only).
+    open_docs: std::collections::HashSet<String>,
+    /// rust-analyzer has reported `quiescent: true` via `experimental/
+    /// serverStatus` — i.e. it has finished loading + indexing and hovers now
+    /// resolve. Stays false for Bifrost (which is ready immediately).
+    ra_quiescent: bool,
 }
 
 #[derive(Clone)]
@@ -77,32 +124,44 @@ pub fn trace(message: impl std::fmt::Display) {
 impl LspClient {
     pub fn start(
         root: PathBuf,
+        backend: LspBackend,
         progress: Arc<Mutex<LspProgress>>,
         warmup: Option<LspPosition>,
     ) -> Result<Self> {
-        let (bin, args) = bifrost_server_command(&root)?;
+        // Canonicalize up front so `self.root` matches the form the server
+        // sees: request URIs go through `file_uri` (which canonicalizes) and
+        // response URIs are mapped back by stripping `self.root`. A symlinked
+        // component (common on macOS: /tmp, /var, cache dirs) would otherwise
+        // fail to strip and silently drop every definition.
+        let root = root.canonicalize().unwrap_or(root);
+        let (bin, args) = server_command(backend, &root)?;
         let mut child = Command::new(&bin)
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
-            .with_context(|| format!("failed to start Bifrost LSP: {}", bin.display()))?;
+            .with_context(|| {
+                format!("failed to start {} LSP: {}", backend.label(), bin.display())
+            })?;
         let stdin = child
             .stdin
             .take()
-            .context("Bifrost LSP stdin unavailable")?;
+            .with_context(|| format!("{} LSP stdin unavailable", backend.label()))?;
         let stdout = child
             .stdout
             .take()
-            .context("Bifrost LSP stdout unavailable")?;
+            .with_context(|| format!("{} LSP stdout unavailable", backend.label()))?;
         let mut this = Self {
             root,
+            backend,
             child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
             progress,
+            open_docs: std::collections::HashSet::new(),
+            ra_quiescent: false,
         };
         this.initialize()?;
         this.warm_up(warmup.as_ref())?;
@@ -122,7 +181,16 @@ impl LspClient {
         let Some(hover) = hover else {
             return Ok(None);
         };
-        let definitions = self.definition_with_timeout(pos, timeout)?;
+        // Suppress the tooltip only when hovering a symbol's own declaration.
+        // This is a best-effort refinement on top of a hover that already
+        // succeeded, so it must never discard it: bound the extra lookup to a
+        // short budget and treat a slow/failed definition as "not a
+        // declaration" rather than propagating the error (which would drop the
+        // hover — worst under rust-analyzer, whose definition can be slow while
+        // indexing).
+        let definitions = self
+            .definition_with_timeout(pos, timeout.min(SUPPRESSION_TIMEOUT))
+            .unwrap_or_default();
         if definitions
             .iter()
             .any(|target| target_contains_position(target, pos))
@@ -143,6 +211,7 @@ impl LspClient {
         pos: &LspPosition,
         timeout: Duration,
     ) -> Result<Option<HoverResult>> {
+        self.ensure_open(&pos.path)?;
         let params = json!({
             "textDocument": { "uri": self.uri_for(&pos.path)? },
             "position": { "line": pos.line, "character": pos.character },
@@ -183,6 +252,7 @@ impl LspClient {
         pos: &LspPosition,
         timeout: Duration,
     ) -> Result<Vec<DefinitionTarget>> {
+        self.ensure_open(&pos.path)?;
         let params = json!({
             "textDocument": { "uri": self.uri_for(&pos.path)? },
             "position": { "line": pos.line, "character": pos.character },
@@ -209,14 +279,35 @@ impl LspClient {
             progress.percentage = Some(99);
             progress.done = false;
         }
-        if let Some(pos) = pos {
-            let _ = self.definition_with_timeout(pos, Duration::from_secs(30))?;
-        } else {
-            self.request(
-                "workspace/symbol",
-                json!({ "query": "" }),
-                Duration::from_secs(30),
-            )?;
+        match (self.backend, pos) {
+            // rust-analyzer answers nothing until it has loaded the workspace
+            // and indexed; readiness is signalled by `experimental/serverStatus`
+            // going `quiescent: true`. Pump incoming notifications until then
+            // (or the deadline) so "ready" means hovers actually resolve — and
+            // the status shows "Analyzing" meanwhile, not a stuck "100%".
+            (LspBackend::RustAnalyzer, _) => {
+                let deadline = std::time::Instant::now() + RA_WARMUP_DEADLINE;
+                while !self.ra_quiescent && std::time::Instant::now() < deadline {
+                    match self.read_message_timeout(Duration::from_millis(500)) {
+                        Ok(msg) => {
+                            self.handle_server_message(&msg)?;
+                        }
+                        // No message this tick (or a read hiccup): loop and
+                        // re-check `ra_quiescent`/deadline.
+                        Err(_) => {}
+                    }
+                }
+            }
+            (_, Some(pos)) => {
+                let _ = self.definition_with_timeout(pos, Duration::from_secs(30))?;
+            }
+            (_, None) => {
+                self.request(
+                    "workspace/symbol",
+                    json!({ "query": "" }),
+                    Duration::from_secs(30),
+                )?;
+            }
         }
         {
             let mut progress = self.progress.lock().unwrap();
@@ -235,6 +326,13 @@ impl LspClient {
             "capabilities": {
                 "window": {
                     "workDoneProgress": true
+                },
+                // rust-analyzer extension: it pushes `experimental/serverStatus`
+                // with `quiescent` so we know when it's actually ready, instead
+                // of guessing from the indexing progress bar (which hits 100%
+                // well before hovers resolve).
+                "experimental": {
+                    "serverStatusNotification": true
                 }
             },
             "workspaceFolders": [{ "uri": root_uri, "name": "lgtm" }]
@@ -329,6 +427,25 @@ impl LspClient {
             }
             Some("$/progress") => {
                 self.apply_progress(msg);
+                Ok(true)
+            }
+            Some("experimental/serverStatus") => {
+                let quiescent = msg
+                    .pointer("/params/quiescent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.ra_quiescent = quiescent;
+                let mut progress = self.progress.lock().unwrap();
+                if quiescent {
+                    progress.message = Some("Ready".to_string());
+                    progress.percentage = Some(100);
+                    progress.done = true;
+                } else {
+                    // Still loading/indexing: an honest label instead of a
+                    // stale "100%" from a finished sub-phase.
+                    progress.message = Some("Analyzing".to_string());
+                    progress.percentage = None;
+                }
                 Ok(true)
             }
             Some(_) => {
@@ -459,28 +576,89 @@ impl LspClient {
         file_uri(&self.root.join(rel))
     }
 
-    fn definition_from_location(&self, loc: Value) -> Option<DefinitionTarget> {
-        let uri = loc.get("uri").or_else(|| loc.get("targetUri"))?.as_str()?;
-        let range = loc.get("range").or_else(|| loc.get("targetRange"))?;
-        let start = range.get("start")?;
-        let end = range.get("end")?;
-        Some(DefinitionTarget {
-            path: rel_path_from_uri(&self.root, uri)?,
-            start_line: start.get("line")?.as_u64()? as u32,
-            start_character: start.get("character")?.as_u64()? as u32,
-            end_line: end.get("line")?.as_u64()? as u32,
-            end_character: end.get("character")?.as_u64()? as u32,
-        })
+    /// rust-analyzer answers hover/definition from its VFS, which is only
+    /// populated for opened documents (or after a full workspace load) — a cold
+    /// query on an unopened file errors with "file not found". So send
+    /// `textDocument/didOpen` once per file with its on-disk content before the
+    /// first request. Bifrost reads straight from disk, so this is skipped there.
+    fn ensure_open(&mut self, rel: &str) -> Result<()> {
+        if self.backend != LspBackend::RustAnalyzer || self.open_docs.contains(rel) {
+            return Ok(());
+        }
+        let Ok(text) = std::fs::read_to_string(self.root.join(rel)) else {
+            return Ok(()); // Missing/binary file: let the request fall through.
+        };
+        let uri = self.uri_for(rel)?;
+        self.notify(
+            "textDocument/didOpen",
+            json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id_for(rel),
+                    "version": 1,
+                    "text": text,
+                }
+            }),
+        )?;
+        self.open_docs.insert(rel.to_string());
+        Ok(())
     }
+
+    fn definition_from_location(&self, loc: Value) -> Option<DefinitionTarget> {
+        definition_target(&self.root, &loc)
+    }
+}
+
+/// LSP `languageId` for a path, by extension. rust-analyzer only cares that
+/// `.rs` maps to `rust`; the rest keep `didOpen` well-formed for other servers.
+fn language_id_for(rel: &str) -> &'static str {
+    match Path::new(rel).extension().and_then(|ext| ext.to_str()) {
+        Some("rs") => "rust",
+        Some("ts") | Some("tsx") => "typescript",
+        Some("js") | Some("jsx") => "javascript",
+        Some("py") => "python",
+        Some("go") => "go",
+        Some("c") | Some("h") => "c",
+        Some("cc") | Some("cpp") | Some("cxx") | Some("hpp") => "cpp",
+        _ => "plaintext",
+    }
+}
+
+/// Parse one `Location`/`LocationLink` into a [`DefinitionTarget`]. The path is
+/// repo-relative when the target lives under `root`, otherwise the absolute
+/// on-disk path — so go-to-definition can open dependency and stdlib sources
+/// (which rust-analyzer points at, outside the workspace).
+fn definition_target(root: &Path, loc: &Value) -> Option<DefinitionTarget> {
+    let uri = loc.get("uri").or_else(|| loc.get("targetUri"))?.as_str()?;
+    // Prefer the name range (`targetSelectionRange`) over the whole-item range
+    // (`targetRange`, which for a function spans its entire body): it makes
+    // go-to-definition land on the name, and — used for the declaration-
+    // suppression check — keeps calls made from inside a function's own body
+    // (e.g. recursion) from being treated as its declaration. Plain `Location`
+    // responses carry only `range`, which rust-analyzer already sets to the name.
+    let range = loc
+        .get("targetSelectionRange")
+        .or_else(|| loc.get("range"))
+        .or_else(|| loc.get("targetRange"))?;
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+    Some(DefinitionTarget {
+        path: path_from_uri(root, uri)?,
+        start_line: start.get("line")?.as_u64()? as u32,
+        start_character: start.get("character")?.as_u64()? as u32,
+        end_line: end.get("line")?.as_u64()? as u32,
+        end_character: end.get("character")?.as_u64()? as u32,
+    })
 }
 
 impl LspSession {
     pub fn start(
         root: PathBuf,
+        backend: LspBackend,
         progress: Arc<Mutex<LspProgress>>,
         warmup: Option<LspPosition>,
     ) -> Result<Self> {
-        let mut client = LspClient::start(root, progress, warmup)?;
+        let mut client = LspClient::start(root, backend, progress, warmup)?;
         let (commands, receiver) = mpsc::channel();
         std::thread::Builder::new()
             .name("bifrost-lsp".to_string())
@@ -578,17 +756,34 @@ impl Drop for LspClient {
     }
 }
 
-fn bifrost_server_command(root: &Path) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
-    if let Some(bin) = std::env::var_os("LGTM_BIFROST") {
-        return Ok((
-            PathBuf::from(bin),
-            vec!["--root".into(), root.as_os_str().to_owned(), "--lsp".into()],
-        ));
+fn server_command(
+    backend: LspBackend,
+    root: &Path,
+) -> Result<(PathBuf, Vec<std::ffi::OsString>)> {
+    match backend {
+        LspBackend::Bifrost => {
+            if let Some(bin) = std::env::var_os("LGTM_BIFROST") {
+                return Ok((
+                    PathBuf::from(bin),
+                    vec!["--root".into(), root.as_os_str().to_owned(), "--lsp".into()],
+                ));
+            }
+            Ok((
+                std::env::current_exe()
+                    .context("locating LGTM executable for embedded Bifrost LSP")?,
+                vec!["--bifrost-lsp-server".into(), root.as_os_str().to_owned()],
+            ))
+        }
+        // rust-analyzer speaks LSP over stdio with no args; it takes the
+        // workspace from `rootUri` in the initialize handshake. Overridable via
+        // LGTM_RUST_ANALYZER, else found on PATH.
+        LspBackend::RustAnalyzer => {
+            let bin = std::env::var_os("LGTM_RUST_ANALYZER")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("rust-analyzer"));
+            Ok((bin, Vec::new()))
+        }
     }
-    Ok((
-        std::env::current_exe().context("locating LGTM executable for embedded Bifrost LSP")?,
-        vec!["--bifrost-lsp-server".into(), root.as_os_str().to_owned()],
-    ))
 }
 
 fn file_uri(path: &Path) -> Result<String> {
@@ -609,6 +804,17 @@ fn rel_path_from_uri(root: &Path, uri: &str) -> Option<String> {
     let path = PathBuf::from(percent_decode(raw)?);
     let rel = path.strip_prefix(root).ok()?;
     Some(rel.to_string_lossy().replace('\\', "/"))
+}
+
+/// Repo-relative path when the URI is under `root`, else its absolute on-disk
+/// path (dependency / stdlib sources that rust-analyzer resolves to live
+/// outside the workspace, but are still present on disk and worth opening).
+fn path_from_uri(root: &Path, uri: &str) -> Option<String> {
+    if let Some(rel) = rel_path_from_uri(root, uri) {
+        return Some(rel);
+    }
+    let raw = uri.strip_prefix("file://")?;
+    percent_decode(raw)
 }
 
 fn percent_encode(input: &str) -> String {
@@ -711,6 +917,80 @@ mod tests {
     }
 
     #[test]
+    fn definition_target_prefers_name_range_over_item_range() {
+        let root = Path::new("/repo");
+        // LocationLink: the name range (targetSelectionRange) must win over the
+        // whole-item targetRange, so suppression and navigation key off the
+        // declaration name, not the entire function body.
+        let link = json!({
+            "targetUri": "file:///repo/src/lib.rs",
+            "targetRange": {
+                "start": { "line": 10, "character": 0 },
+                "end": { "line": 40, "character": 1 },
+            },
+            "targetSelectionRange": {
+                "start": { "line": 10, "character": 3 },
+                "end": { "line": 10, "character": 8 },
+            },
+        });
+        let target = definition_target(root, &link).expect("link maps under root");
+        assert_eq!(target.path, "src/lib.rs");
+        assert_eq!((target.start_line, target.start_character), (10, 3));
+        assert_eq!((target.end_line, target.end_character), (10, 8));
+    }
+
+    #[test]
+    fn definition_target_maps_in_repo_relative_and_external_absolute() {
+        let root = Path::new("/repo");
+        let loc = json!({
+            "uri": "file:///repo/src/main.rs",
+            "range": {
+                "start": { "line": 2, "character": 4 },
+                "end": { "line": 2, "character": 7 },
+            },
+        });
+        let target = definition_target(root, &loc).expect("location maps under root");
+        assert_eq!(target.path, "src/main.rs");
+        assert_eq!(target.start_line, 2);
+        // A definition outside the workspace root (dependency / stdlib) keeps its
+        // absolute on-disk path so go-to-definition can still open it.
+        let external = json!({
+            "uri": "file:///home/user/.cargo/registry/foo/lib.rs",
+            "range": {
+                "start": { "line": 0, "character": 0 },
+                "end": { "line": 0, "character": 1 },
+            },
+        });
+        let ext = definition_target(root, &external).expect("external target still resolves");
+        assert_eq!(ext.path, "/home/user/.cargo/registry/foo/lib.rs");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canonical_root_strips_symlinked_paths() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("lgtm-lsp-canon-{}", std::process::id()));
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("src")).unwrap();
+        std::fs::write(real.join("src/lib.rs"), "").unwrap();
+        let link = base.join("link");
+        let _ = std::fs::remove_file(&link);
+        symlink(&real, &link).unwrap();
+
+        // The server reports canonical URIs (`file_uri` canonicalizes). Stripping
+        // the raw, symlinked root fails; the canonical root (what
+        // `LspClient::start` now stores) strips cleanly.
+        let canonical_uri = file_uri(&link.join("src/lib.rs")).unwrap();
+        assert!(rel_path_from_uri(&link, &canonical_uri).is_none());
+        let canonical_root = link.canonicalize().unwrap();
+        assert_eq!(
+            rel_path_from_uri(&canonical_root, &canonical_uri).as_deref(),
+            Some("src/lib.rs")
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
     #[ignore = "requires LGTM_LSP_SMOKE_ROOT pointing at a checkout and a Bifrost binary"]
     fn bifrost_lsp_smoke_hover_and_definition() {
         let root = PathBuf::from(
@@ -720,8 +1000,13 @@ mod tests {
         let progress = Arc::new(Mutex::new(LspProgress::default()));
         let rel = "crates/app/src/main.rs";
         let definition_pos = position_of(&root, rel, "mono_family(&cfg)");
-        let mut client = LspClient::start(root.clone(), progress, Some(definition_pos.clone()))
-            .expect("start Bifrost LSP");
+        let mut client = LspClient::start(
+            root.clone(),
+            LspBackend::Bifrost,
+            progress,
+            Some(definition_pos.clone()),
+        )
+        .expect("start Bifrost LSP");
 
         let targets = client
             .definition(&definition_pos)
@@ -820,7 +1105,7 @@ mod tests {
         let declaration = position_in_line(&root, rel, "fn mono_family(cfg:", "mono_family", 0);
         let cfg_reference = position_in_line(&root, rel, "if cfg.font.mono_family", "cfg.font", 0);
         let progress = Arc::new(Mutex::new(LspProgress::default()));
-        let session = LspSession::start(root, progress, Some(call.clone()))
+        let session = LspSession::start(root, LspBackend::Bifrost, progress, Some(call.clone()))
             .expect("start Bifrost LSP session");
 
         let definitions = session
@@ -850,5 +1135,92 @@ mod tests {
             declaration_hover.is_none(),
             "declaration hover should be suppressed"
         );
+    }
+
+    #[test]
+    #[ignore = "requires rust-analyzer on PATH + rust-src; proves type-aware resolution"]
+    fn rust_analyzer_backend_resolves_methods_and_external_defs() {
+        // A tiny buildable crate whose `s.m()` needs the receiver's type
+        // inferred — exactly what Bifrost's lexical resolver can't do and
+        // rust-analyzer can. This is the reason the "LSP" chip offers the swap.
+        let dir = std::env::temp_dir().join(format!("lgtm-ra-smoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"smoke\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        let src = "pub struct S;\n\
+                   impl S {\n\
+                   \x20   pub fn m(&self) -> i32 { 1 }\n\
+                   }\n\
+                   pub fn caller(s: &S) -> Option<i32> {\n\
+                   \x20   let _ = s.m();\n\
+                   \x20   None\n\
+                   }\n";
+        std::fs::write(dir.join("src/lib.rs"), src).unwrap();
+
+        let at = |needle: &str, offset: u32| {
+            let (line, col) = src
+                .lines()
+                .enumerate()
+                .find_map(|(i, l)| l.find(needle).map(|c| (i as u32, c as u32 + offset)))
+                .unwrap_or_else(|| panic!("{needle:?} present"));
+            LspPosition {
+                path: "src/lib.rs".to_string(),
+                line,
+                character: col,
+            }
+        };
+        // `m` inside `s.m()`, and `Option` in the return type (ASCII → byte==char).
+        let method_pos = at("s.m()", 2);
+        let option_pos = at("Option<i32>", 0);
+
+        let progress = Arc::new(Mutex::new(LspProgress::default()));
+        let session = LspSession::start(
+            dir.clone(),
+            LspBackend::RustAnalyzer,
+            progress,
+            Some(method_pos.clone()),
+        )
+        .expect("start rust-analyzer session");
+
+        // Type inference resolves the method call.
+        let hover = session
+            .hover(method_pos, Arc::new(AtomicBool::new(false)))
+            .expect("hover request should finish")
+            .expect("rust-analyzer should resolve the method call");
+        assert!(
+            hover.text.contains("fn m"),
+            "method hover should include the signature, got {:?}",
+            hover.text
+        );
+
+        // Go-to-definition on a std type resolves outside the workspace and now
+        // keeps its absolute on-disk path (the dependency/stdlib navigation fix).
+        let defs = session
+            .definition(option_pos)
+            .expect("definition request should finish");
+        let ext = defs
+            .iter()
+            .find(|d| Path::new(&d.path).is_absolute())
+            .unwrap_or_else(|| panic!("expected an out-of-workspace target, got {defs:?}"));
+        assert!(
+            !ext.path.starts_with(dir.to_string_lossy().as_ref()),
+            "std definition should live outside the crate, got {}",
+            ext.path
+        );
+        assert!(
+            ext.path.ends_with("option.rs"),
+            "Option should resolve into core's option.rs, got {}",
+            ext.path
+        );
+        assert!(
+            std::path::Path::new(&ext.path).exists(),
+            "the resolved dependency source should be on disk: {}",
+            ext.path
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
