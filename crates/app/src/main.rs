@@ -3632,6 +3632,119 @@ fn lsp_worktree_root(loc: &gh::PrLocator, head_oid: &str) -> anyhow::Result<Path
         .join(key))
 }
 
+/// `~/.cache/lgtm/worktrees` — the parent of the per-PR LSP checkouts.
+fn worktrees_root() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".cache")
+            .join("lgtm")
+            .join("worktrees"),
+    )
+}
+
+/// A PR whose LSP worktree(s) are cached on disk, surfaced in the sidebar so a
+/// past review can be reopened or its cache cleaned up.
+#[derive(Clone)]
+struct CachedPr {
+    loc: gh::PrLocator,
+    /// Every cached worktree dir for this PR (one per reviewed head oid).
+    dirs: Vec<PathBuf>,
+}
+
+/// Scan the worktree cache for reviewable PRs, grouped by PR and most-recently
+/// used first. Blocking (a `git` call per dir) — run off the UI thread.
+fn scan_cached_prs() -> Vec<CachedPr> {
+    let Some(root) = worktrees_root() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    // (locator, dirs, latest mtime) — one entry per distinct PR.
+    let mut grouped: Vec<(gh::PrLocator, Vec<PathBuf>, std::time::SystemTime)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Skip half-written clones from an in-progress materialize.
+        if name.contains(".tmp-") {
+            continue;
+        }
+        let Some(number) = cached_pr_number(&name) else {
+            continue;
+        };
+        // The dir name sanitizes owner/repo lossily, so recover the real slug
+        // from the clone's origin remote.
+        let Some((owner, repo)) = worktree_remote(&path) else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        match grouped
+            .iter_mut()
+            .find(|(l, ..)| l.owner == owner && l.repo == repo && l.number == number)
+        {
+            Some((_, dirs, latest)) => {
+                dirs.push(path);
+                *latest = (*latest).max(mtime);
+            }
+            None => grouped.push((
+                gh::PrLocator {
+                    owner,
+                    repo,
+                    number,
+                },
+                vec![path],
+                mtime,
+            )),
+        }
+    }
+    grouped.sort_by(|a, b| b.2.cmp(&a.2));
+    grouped
+        .into_iter()
+        .map(|(loc, dirs, _)| CachedPr { loc, dirs })
+        .collect()
+}
+
+/// PR number from a `{owner}__{repo}__pr{N}__{oid}` worktree dir name.
+fn cached_pr_number(dir_name: &str) -> Option<u64> {
+    let after = dir_name.rsplit_once("__pr")?.1;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Owner/repo from a cached clone's `origin` remote URL.
+fn worktree_remote(dir: &Path) -> Option<(String, String)> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    parse_github_owner_repo(url.trim())
+}
+
+/// Owner/repo from a GitHub remote URL (https, ssh, or scp-style).
+fn parse_github_owner_repo(url: &str) -> Option<(String, String)> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("git@github.com:"))
+        .or_else(|| url.strip_prefix("github.com/"))?;
+    let (owner, repo) = rest.strip_suffix(".git").unwrap_or(rest).split_once('/')?;
+    (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
+}
+
 fn sanitize_path_part(input: &str) -> String {
     input
         .chars()
@@ -3841,6 +3954,9 @@ struct ReviewApp {
     /// Bumped on every review-dialog open/close, same protocol as
     /// `composer_gen`.
     review_gen: u64,
+    /// PRs with cached LSP worktrees on disk, listed in the sidebar to reopen or
+    /// clean up. Filled by a background scan when the app starts.
+    cached_prs: Vec<CachedPr>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3947,13 +4063,56 @@ impl ReviewApp {
             composer_gen: 0,
             review: None,
             review_gen: 0,
+            cached_prs: Vec::new(),
             _subscriptions,
         };
+        this.refresh_cached_prs(cx);
         for source in sources {
             this.open_item(source, cx);
         }
         this.active = 0;
         this
+    }
+
+    /// Rescan the worktree cache (off the UI thread) and repopulate the
+    /// sidebar's cached-PR list.
+    fn refresh_cached_prs(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let cached = cx.background_spawn(async move { scan_cached_prs() }).await;
+            this.update(cx, |app, cx| {
+                app.cached_prs = cached;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open a cached PR (activating it if already open), from a sidebar click.
+    fn open_cached_pr(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(loc) = self.cached_prs.get(ix).map(|cached| cached.loc.clone()) else {
+            return;
+        };
+        if let Some(existing) = self.items.iter().position(|item| {
+            matches!(&item.source, Source::Pr(l)
+                if l.owner == loc.owner && l.repo == loc.repo && l.number == loc.number)
+        }) {
+            self.activate(existing, window, cx);
+            return;
+        }
+        self.open_item(Source::Pr(loc), cx);
+    }
+
+    /// Delete a cached PR's worktree(s) from disk and drop it from the list.
+    fn delete_cached_pr(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.cached_prs.len() {
+            return;
+        }
+        for dir in &self.cached_prs[ix].dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        self.cached_prs.remove(ix);
+        cx.notify();
     }
 
     fn active_item(&self) -> Option<&ReviewItem> {
@@ -4790,9 +4949,16 @@ impl ReviewApp {
             data.chat.cancel.store(true, Ordering::Relaxed);
         }
         let _ = std::fs::remove_dir_all(chat_scratch_root(item.id));
+        let was_pr = matches!(item.source, Source::Pr(_));
         self.items.remove(ix);
         if self.active > ix || self.active >= self.items.len() {
             self.active = self.active.saturating_sub(1);
+        }
+        // A PR reviewed this session may have just materialized its worktree;
+        // rescan so it (re)appears in the sidebar's cached list now that it's
+        // closed, rather than only after a restart.
+        if was_pr {
+            self.refresh_cached_prs(cx);
         }
         cx.notify();
     }
@@ -6900,6 +7066,86 @@ impl ReviewApp {
             list = list.child(entry);
         }
 
+        // --- cached PRs (past reviews with an on-disk worktree) ---
+        // Skip any that are already open above, so each PR shows once.
+        let open_pr_keys: Vec<(String, String, u64)> = self
+            .items
+            .iter()
+            .filter_map(|item| match &item.source {
+                Source::Pr(l) => Some((l.owner.clone(), l.repo.clone(), l.number)),
+                Source::Local(_) => None,
+            })
+            .collect();
+        let cached: Vec<(usize, SharedString)> = self
+            .cached_prs
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !open_pr_keys.iter().any(|(o, r, n)| {
+                    *o == c.loc.owner && *r == c.loc.repo && *n == c.loc.number
+                })
+            })
+            .map(|(ix, c)| (ix, SharedString::from(format!("{}#{}", c.loc.repo_slug(), c.loc.number))))
+            .collect();
+        if !cached.is_empty() {
+            list = list.child(
+                div()
+                    .mx_1()
+                    .mt_2()
+                    .px_2()
+                    .pb_1()
+                    .text_size(px(10.))
+                    .text_color(theme::overlay0())
+                    .child(SharedString::from("CACHED PRS")),
+            );
+            for (ix, label) in cached {
+                let entry = div()
+                    .id(("cached-pr", ix))
+                    .group("cached-pr")
+                    .mx_1()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(Hsla::from(theme::surface0()).opacity(0.5)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_cached_pr(ix, window, cx)
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .text_color(theme::subtext())
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .opacity(0.)
+                                    .group_hover("cached-pr", |style| style.opacity(1.))
+                                    .child(
+                                        Button::new(("delete-cached", ix))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall()
+                                            .tooltip("Delete cached worktree")
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.delete_cached_pr(ix, cx)
+                                            })),
+                                    ),
+                            ),
+                    );
+                list = list.child(entry);
+            }
+        }
+
         // --- file tree for the active item ---
         let query = self.tree_filter_input.read(cx).value().trim().to_string();
         let mut tree_rows: Vec<TreeListRow> = Vec::new();
@@ -7949,6 +8195,39 @@ impl Render for ReviewApp {
 mod tests {
     use super::*;
     use diff_core::{FileDiff, Hunk};
+
+    #[test]
+    fn cached_pr_dir_names_parse() {
+        assert_eq!(
+            cached_pr_number("atuinsh__atuin__pr3592__5467566b7eb4"),
+            Some(3592)
+        );
+        assert_eq!(
+            cached_pr_number("oxidecomputer__propolis__pr966__cb6365959879"),
+            Some(966)
+        );
+        // Repos/owners with underscores don't confuse the `__pr` split.
+        assert_eq!(cached_pr_number("a_b__c_d__pr7__deadbeef"), Some(7));
+        assert_eq!(cached_pr_number("no-number-here"), None);
+    }
+
+    #[test]
+    fn github_remote_urls_parse_to_owner_repo() {
+        let expect = Some(("atuinsh".to_string(), "atuin".to_string()));
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/atuinsh/atuin.git"),
+            expect
+        );
+        assert_eq!(
+            parse_github_owner_repo("git@github.com:atuinsh/atuin.git"),
+            expect
+        );
+        assert_eq!(
+            parse_github_owner_repo("https://github.com/atuinsh/atuin"),
+            expect
+        );
+        assert_eq!(parse_github_owner_repo("https://gitlab.com/a/b.git"), None);
+    }
 
     fn mention(login: &str, name: Option<&str>) -> gh::Mention {
         gh::Mention {
