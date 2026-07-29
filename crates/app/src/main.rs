@@ -28,7 +28,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -39,8 +39,37 @@ use lsp_client::{
 };
 
 const MONO: &str = "Menlo";
-const ROW_HEIGHT: f32 = 22.0;
-const TEXT_SIZE: f32 = 13.0;
+
+/// Diff pane font size in px, adjustable at runtime (cmd-+ / cmd-- / cmd-0).
+/// A process-wide cell rather than a plumbed parameter: it feeds free
+/// functions (row building, minimap, hit tests) as well as render, and the app
+/// is a single window, so threading it through every call site would be pure
+/// churn. Only the main thread writes it.
+static FONT_PX: AtomicU32 = AtomicU32::new(DEFAULT_TEXT_SIZE as u32);
+const DEFAULT_TEXT_SIZE: f32 = 13.0;
+/// Zoom bounds; below ~7px glyphs stop being legible, above ~28px a diff row
+/// wastes most of the window.
+const MIN_TEXT_SIZE: f32 = 7.0;
+const MAX_TEXT_SIZE: f32 = 28.0;
+/// Row height as a multiple of the font size. 13 * 1.7 ≈ 22, the height this
+/// pane used before zoom existed, so the default look is unchanged.
+const LINE_HEIGHT_RATIO: f32 = 1.7;
+
+fn text_size() -> f32 {
+    FONT_PX.load(Ordering::Relaxed) as f32
+}
+
+/// Row height for a given font size. Kept pure so it's testable without
+/// touching the process-wide size.
+fn row_height_for(size: f32) -> f32 {
+    (size * LINE_HEIGHT_RATIO).round()
+}
+
+/// Height of one diff row. Derived from the font so text never outgrows its
+/// row; every scroll/hit-test/minimap calculation keys off this.
+fn row_height() -> f32 {
+    row_height_for(text_size())
+}
 
 /// Gutter widths in px, matching render_row's fixed-width children: unified is
 /// two 44px line-number columns + a 28px marker; each split cell is one of
@@ -77,6 +106,9 @@ actions!(
         ToggleComments,
         ToggleChat,
         SubmitReview,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
         GoToDefinition,
         NavBack,
         NavForward
@@ -151,6 +183,12 @@ fn main() {
                 KeyBinding::new("cmd-right", NavForward, Some("ReviewApp")),
                 KeyBinding::new("alt-left", NavBack, Some("ReviewApp")),
                 KeyBinding::new("alt-right", NavForward, Some("ReviewApp")),
+                // Zoom. Bind both "cmd-=" and "cmd-+" so it fires with or
+                // without shift, the way browsers and editors behave.
+                KeyBinding::new("cmd-=", ZoomIn, None),
+                KeyBinding::new("cmd-+", ZoomIn, None),
+                KeyBinding::new("cmd--", ZoomOut, None),
+                KeyBinding::new("cmd-0", ZoomReset, None),
                 // Global (None context): must work while the open input is focused.
                 KeyBinding::new("cmd-b", ToggleSidebar, None),
                 KeyBinding::new("cmd-j", ToggleChat, None),
@@ -1380,7 +1418,7 @@ fn comment_row(
                     .child(inner)
             })
     };
-    let row = div().h(px(ROW_HEIGHT)).w_full().flex();
+    let row = div().h(px(row_height())).w_full().flex();
     match half {
         // Unified: one column, so the card spans it.
         None => row.child(card(inner)).into_any_element(),
@@ -1423,7 +1461,7 @@ fn render_row(
     selection: Option<(SelSide, Range<usize>)>,
     entity: &gpui::Entity<ReviewApp>,
 ) -> gpui::AnyElement {
-    let row_height = px(ROW_HEIGHT);
+    let row_height = px(row_height());
     match row {
         Row::CommentHeader {
             author,
@@ -2364,8 +2402,8 @@ impl ItemData {
         let offset = self.scroll.0.borrow().base_handle.offset();
         let top_px = f32::from(-offset.y).max(0.);
         let top_row =
-            ((top_px / ROW_HEIGHT).floor() as usize).min(self.rows.len().saturating_sub(1));
-        let frac = top_px - top_row as f32 * ROW_HEIGHT;
+            ((top_px / row_height()).floor() as usize).min(self.rows.len().saturating_sub(1));
+        let frac = top_px - top_row as f32 * row_height();
         let count_noncomment =
             |rows: &[Row]| rows.iter().filter(|row| !is_comment_row(row)).count();
         let top_base = count_noncomment(&self.rows[..top_row]);
@@ -2385,7 +2423,7 @@ impl ItemData {
             .0
             .borrow()
             .base_handle
-            .set_offset(point(offset.x, px(-(new_top as f32 * ROW_HEIGHT + frac))));
+            .set_offset(point(offset.x, px(-(new_top as f32 * row_height() + frac))));
     }
 
     /// The minimap quad runs for this pane height, from the cache when the
@@ -4075,7 +4113,7 @@ struct ReviewApp {
     chat_visible: bool,
     /// A minimap scrub drag is in progress (mouse went down on the minimap).
     minimap_scrub: bool,
-    /// Advance width of one monospace cell at (MONO, TEXT_SIZE), measured once.
+    /// Advance width of one monospace cell at (MONO, text_size()), measured once.
     char_width: Option<Pixels>,
     /// Diff row + split half under the pointer where a hover "+" (new
     /// comment) affordance shows; None when the pointer isn't on a
@@ -4280,6 +4318,40 @@ impl ReviewApp {
         }
     }
 
+    /// Step the diff font size (cmd-+ / cmd-- / cmd-0). Row height follows the
+    /// font, so every item's scroll offset is rescaled to keep the same line at
+    /// the top — otherwise the pixel offset would silently mean a different row.
+    fn zoom(&mut self, delta: f32, reset: bool, cx: &mut Context<Self>) {
+        let old_rh = row_height();
+        let next = if reset {
+            DEFAULT_TEXT_SIZE
+        } else {
+            (text_size() + delta).clamp(MIN_TEXT_SIZE, MAX_TEXT_SIZE)
+        };
+        if next == text_size() {
+            return; // Already at the bound; nothing to redraw.
+        }
+        FONT_PX.store(next as u32, Ordering::Relaxed);
+        let new_rh = row_height();
+        // The cached advance width was measured at the old size.
+        self.char_width = None;
+        for item in &mut self.items {
+            let ItemState::Ready(data) = &mut item.state else {
+                continue;
+            };
+            let offset = data.scroll.0.borrow().base_handle.offset();
+            let top_row = (-f32::from(offset.y) / old_rh).max(0.);
+            data.scroll
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(point(offset.x, px(-(top_row * new_rh))));
+            // Minimap geometry is height-derived; drop the memoized layout.
+            data.minimap_cache.replace(None);
+        }
+        cx.notify();
+    }
+
     fn active_item(&self) -> Option<&ReviewItem> {
         self.items.get(self.active)
     }
@@ -4305,8 +4377,8 @@ impl ReviewApp {
             let text_system = window.text_system();
             let font_id = text_system.resolve_font(&font(MONO));
             text_system
-                .em_advance(font_id, px(TEXT_SIZE))
-                .unwrap_or(px(TEXT_SIZE * 0.6))
+                .em_advance(font_id, px(text_size()))
+                .unwrap_or(px(text_size() * 0.6))
         })
     }
 
@@ -4341,7 +4413,7 @@ impl ReviewApp {
         };
         // offset.y is negative when scrolled down.
         let y = f32::from(position.y - bounds.top() - offset.y);
-        let row = ((y / ROW_HEIGHT).floor().max(0.) as usize).min(data.rows.len() - 1);
+        let row = ((y / row_height()).floor().max(0.) as usize).min(data.rows.len() - 1);
         let rel_x = f32::from(position.x - bounds.left());
         let (side, text_x) = match data.mode {
             // offset.x is negative when scrolled right (unified mode only;
@@ -4681,11 +4753,11 @@ impl ReviewApp {
             let scroll = data.scroll.0.borrow();
             let offset = scroll.base_handle.offset();
             // offset.y is negative when scrolled down.
-            let top_row = (f32::from(-offset.y) / ROW_HEIGHT).floor() as usize;
+            let top_row = (f32::from(-offset.y) / row_height()).floor() as usize;
             if gap_row < top_row {
                 scroll
                     .base_handle
-                    .set_offset(point(offset.x, offset.y - px(inserted as f32 * ROW_HEIGHT)));
+                    .set_offset(point(offset.x, offset.y - px(inserted as f32 * row_height())));
             }
         }
         cx.notify();
@@ -5284,8 +5356,8 @@ impl ReviewApp {
         let px_per_row = slot_h / group as f32;
         let y = f32::from(position.y - bounds.top());
         let row = (y / px_per_row).clamp(0., (total - 1) as f32);
-        let target = row * ROW_HEIGHT - (pane_h - ROW_HEIGHT) / 2.;
-        let max_scroll = (total as f32 * ROW_HEIGHT - pane_h).max(0.);
+        let target = row * row_height() - (pane_h - row_height()) / 2.;
+        let max_scroll = (total as f32 * row_height() - pane_h).max(0.);
         data.scroll
             .0
             .borrow()
@@ -5369,7 +5441,7 @@ impl ReviewApp {
         };
         let shaped = window.text_system().shape_line(
             SharedString::from(text.to_string()),
-            px(TEXT_SIZE),
+            px(text_size()),
             &[TextRun {
                 len: text.len(),
                 font: font(MONO),
@@ -6605,7 +6677,7 @@ impl ReviewApp {
                     return;
                 };
                 let chat = &mut data.chat;
-                let dy = f32::from(event.delta.pixel_delta(px(ROW_HEIGHT)).y);
+                let dy = f32::from(event.delta.pixel_delta(px(row_height())).y);
                 if dy > 0. {
                     chat.stick_to_bottom = false;
                 } else {
@@ -6696,8 +6768,8 @@ impl ReviewApp {
             (state.base_handle.bounds(), state.base_handle.offset())
         };
         // Pane-relative y of the hovered row; skip when scrolled out of view.
-        let y = row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
-        if y < 0. || y + ROW_HEIGHT > f32::from(bounds.size.height) {
+        let y = row_ix as f32 * row_height() + f32::from(offset.y);
+        if y < 0. || y + row_height() > f32::from(bounds.size.height) {
             return None;
         }
         let x = match (data.mode, side) {
@@ -6711,7 +6783,7 @@ impl ReviewApp {
             div()
                 .absolute()
                 .left(px(x))
-                .top(px(y + (ROW_HEIGHT - 16.) / 2.))
+                .top(px(y + (row_height() - 16.) / 2.))
                 .w(px(16.))
                 .h(px(16.))
                 .rounded_sm()
@@ -6754,8 +6826,8 @@ impl ReviewApp {
             (state.base_handle.bounds(), state.base_handle.offset())
         };
         let pane_h = f32::from(bounds.size.height);
-        let row_y = composer.row_ix as f32 * ROW_HEIGHT + f32::from(offset.y);
-        let y = f32::from(bounds.top()) + (row_y + ROW_HEIGHT).clamp(8., (pane_h - 250.).max(8.));
+        let row_y = composer.row_ix as f32 * row_height() + f32::from(offset.y);
+        let y = f32::from(bounds.top()) + (row_y + row_height()).clamp(8., (pane_h - 250.).max(8.));
         let x = (f32::from(bounds.left()) + 72.).min((f32::from(bounds.right()) - 528.).max(8.));
         let action = if composer.reply_to.is_some() {
             "Reply"
@@ -7064,8 +7136,8 @@ impl ReviewApp {
                         // Viewport indicator — the only per-frame math.
                         let offset_y = f32::from(-data.scroll.0.borrow().base_handle.offset().y);
                         let px_per_row = layout.slot_h / layout.group as f32;
-                        let top_row = offset_y / ROW_HEIGHT;
-                        let visible = (pane_h / ROW_HEIGHT).min(total as f32 - top_row);
+                        let top_row = offset_y / row_height();
+                        let visible = (pane_h / row_height()).min(total as f32 - top_row);
                         let vy = top_row * px_per_row;
                         let vh = (visible * px_per_row).max(3.);
                         window.paint_quad(
@@ -7335,12 +7407,12 @@ impl ReviewApp {
             // Follow the diff: highlight the file whose header row is at (or
             // scrolled past) the top of the viewport. A pending scroll_to_item
             // (from ]/[ or a tree click) hasn't reached the offset yet, so it
-            // takes precedence; otherwise the same offset/ROW_HEIGHT math the
+            // takes precedence; otherwise the same offset/row_height() math the
             // selection hit test uses.
             let scroll = data.scroll.0.borrow();
             let top_row = match &scroll.deferred_scroll_to_item {
                 Some(deferred) => deferred.item_index,
-                None => (f32::from(-scroll.base_handle.offset().y) / ROW_HEIGHT).max(0.) as usize,
+                None => (f32::from(-scroll.base_handle.offset().y) / row_height()).max(0.) as usize,
             };
             drop(scroll);
             current_file = data.file_rows.iter().rposition(|&ix| ix <= top_row);
@@ -7869,8 +7941,8 @@ impl ReviewApp {
             .flex()
             .flex_col()
             .font_family(MONO)
-            .text_size(px(TEXT_SIZE))
-            .line_height(px(ROW_HEIGHT))
+            .text_size(px(text_size()))
+            .line_height(px(row_height()))
             .child(
                 div()
                     .h(px(30.))
@@ -7911,7 +7983,7 @@ impl ReviewApp {
                 uniform_list("source", lines.len(), move |range, _window, _cx| {
                     range
                         .map(|ix| {
-                            let mut row = div().h(px(ROW_HEIGHT)).flex().items_center();
+                            let mut row = div().h(px(row_height())).flex().items_center();
                             if ix as u32 == target.start_line {
                                 row = row.bg(Hsla::from(theme::blue()).opacity(0.16));
                             }
@@ -8019,8 +8091,8 @@ impl Render for ReviewApp {
                     .relative()
                     .flex()
                     .font_family(MONO)
-                    .text_size(px(TEXT_SIZE))
-                    .line_height(px(ROW_HEIGHT))
+                    .text_size(px(text_size()))
+                    .line_height(px(row_height()))
                     // Selection mouse listeners live on the diff pane only.
                     // While the palette is open its occluding backdrop keeps
                     // this hitbox from being hovered, so none of these fire;
@@ -8292,6 +8364,9 @@ impl Render for ReviewApp {
                 this.sidebar_visible = !this.sidebar_visible;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom(1., false, cx)))
+            .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom(-1., false, cx)))
+            .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom(0., true, cx)))
             .on_action(cx.listener(|this, _: &FocusTreeFilter, window, cx| {
                 this.sidebar_visible = true;
                 this.tree_filter_input
@@ -9923,6 +9998,35 @@ mod tests {
         }
         assert!(threads > 0, "fixture should have threads");
         assert_eq!(tops, threads, "one top edge per thread");
+    }
+
+    #[test]
+    fn zoom_keybindings_parse() {
+        // These strings are only parsed when the app boots, so a typo would be
+        // a runtime panic rather than a compile error.
+        for keys in ["cmd-=", "cmd-+", "cmd--", "cmd-0"] {
+            assert!(
+                Keystroke::parse(keys).is_ok(),
+                "{keys:?} should be a valid keystroke"
+            );
+        }
+    }
+
+    #[test]
+    fn row_height_follows_the_font_size() {
+        // The default must reproduce the pre-zoom geometry exactly.
+        assert_eq!(DEFAULT_TEXT_SIZE, 13.0);
+        assert_eq!(row_height_for(DEFAULT_TEXT_SIZE), 22.0);
+        // Rows grow and shrink with the text, always leaving headroom so
+        // glyphs can't outgrow their row at either bound.
+        assert_eq!(row_height_for(20.), 34.0);
+        assert_eq!(row_height_for(8.), 14.0);
+        for size in [MIN_TEXT_SIZE, DEFAULT_TEXT_SIZE, MAX_TEXT_SIZE] {
+            assert!(
+                row_height_for(size) > size,
+                "row must be taller than {size}px text"
+            );
+        }
     }
 
     #[test]

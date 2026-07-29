@@ -53,6 +53,7 @@ Coming: LSP, AI inline review annotations
 | `cmd-k` | open palette (GitHub PR picker / folder) |
 | `cmd-t` / `cmd-w` / `cmd-b` | quick-open input / close item / toggle sidebar |
 | `ctrl-tab` | cycle open items |
+| `cmd-+` / `cmd--` / `cmd-0` | diff font size: bigger / smaller / reset |
 | `]` / `[` | next / previous file |
 | `n` / `p` | next / previous hunk |
 | `v` | unified ↔ split view |
