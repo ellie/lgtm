@@ -263,16 +263,21 @@ enum Row {
         right: Option<Cell>,
     },
     /// First row of one review comment: author + age. Selectable-through
-    /// like headers, spans full width in both view modes.
+    /// like headers. In split mode `half` places the card in the pane the
+    /// comment was left on (LEFT/RIGHT, like GitHub); None spans full width.
     CommentHeader {
         author: SharedString,
         when: SharedString,
         is_reply: bool,
+        half: Option<CommentSide>,
+        /// First row of the whole thread, so it draws the card's top edge.
+        top: bool,
     },
     /// One soft-wrapped line of a comment body (wrapped at
     /// [`COMMENT_WRAP_CHARS`] when the rows are built).
     CommentBody {
         line: SharedString,
+        half: Option<CommentSide>,
     },
     /// The "↳ reply" affordance closing a thread; clicking opens the
     /// composer targeting `post_reply` on the thread's root comment.
@@ -281,6 +286,7 @@ enum Row {
         path: SharedString,
         side: CommentSide,
         line: u64,
+        half: Option<CommentSide>,
     },
 }
 
@@ -435,8 +441,31 @@ impl LocalReview {
     }
 }
 
-/// Comment bodies soft-wrap at this many chars (the pane is monospace).
-const COMMENT_WRAP_CHARS: usize = 100;
+/// Widest a comment body ever wraps, however roomy the pane: past ~80 columns
+/// prose gets hard to track. Also the fallback before the pane is measured.
+const COMMENT_WRAP_CHARS: usize = 80;
+/// Never wrap narrower than this, however cramped the pane — below it every
+/// word lands on its own line, which is worse than clipping.
+const MIN_COMMENT_WRAP_CHARS: usize = 24;
+
+/// Chrome around a comment body inside its card: the gutter indent, the accent
+/// border, and the horizontal padding (see `comment_row`).
+const COMMENT_CARD_CHROME: f32 = 72. + 2. + 24.;
+
+/// Columns a comment body can use given the measured list width — the whole
+/// width in unified, one half in split. Wrapping is then only as narrow as the
+/// pane forces, capped at [`COMMENT_WRAP_CHARS`] for readability.
+fn comment_wrap_cols(list_width: f32, mode: ViewMode, char_width: f32) -> usize {
+    if char_width <= 0. {
+        return COMMENT_WRAP_CHARS;
+    }
+    let card = match mode {
+        ViewMode::Unified => list_width,
+        ViewMode::Split => (list_width - SPLIT_DIVIDER) / 2.,
+    };
+    let cols = ((card - COMMENT_CARD_CHROME) / char_width).floor();
+    (cols.max(0.) as usize).clamp(MIN_COMMENT_WRAP_CHARS, COMMENT_WRAP_CHARS)
+}
 
 /// Soft-wrap `text` at `width` chars: explicit newlines are preserved, wraps
 /// prefer the last space in range (the space is consumed), and a word longer
@@ -521,7 +550,15 @@ fn push_thread_rows(
     side: CommentSide,
     no: Option<u32>,
     now: i64,
+    mode: ViewMode,
+    wrap: usize,
 ) {
+    // Split mode renders the thread inside the half it was left on, like the
+    // GitHub UI; unified has one column, so the card spans it.
+    let half = match mode {
+        ViewMode::Split => Some(side),
+        ViewMode::Unified => None,
+    };
     let (Some(anchors), Some(no)) = (anchors, no) else {
         return;
     };
@@ -537,9 +574,16 @@ fn push_thread_rows(
                 author: comment.user.login.clone().into(),
                 when: short_age(&comment.created_at, now).into(),
                 is_reply: ix > 0,
+                half,
+                // A thread always opens with its root's header and closes with
+                // the actions row, so those two carry the card's edges.
+                top: ix == 0,
             });
-            for line in wrap_body(&comment.body, COMMENT_WRAP_CHARS) {
-                rows.push(Row::CommentBody { line: line.into() });
+            for line in wrap_body(&comment.body, wrap) {
+                rows.push(Row::CommentBody {
+                    line: line.into(),
+                    half,
+                });
             }
         }
         rows.push(Row::CommentActions {
@@ -547,6 +591,7 @@ fn push_thread_rows(
             path: path.to_string().into(),
             side,
             line: no as u64,
+            half,
         });
     }
 }
@@ -812,6 +857,7 @@ fn push_gap_rows(
     path: &str,
     anchors: Option<&FileAnchors>,
     now: i64,
+    wrap: usize,
 ) {
     let (old_lo, new_lo, count) = gap_span(hunks, gap_ix, upgrade.new_lines.len() as u32);
     if count == 0 {
@@ -863,8 +909,8 @@ fn push_gap_rows(
                 }),
             },
         });
-        push_thread_rows(rows, anchors, path, CommentSide::Left, Some(old_no), now);
-        push_thread_rows(rows, anchors, path, CommentSide::Right, Some(new_no), now);
+        push_thread_rows(rows, anchors, path, CommentSide::Left, Some(old_no), now, ViewMode::Split, wrap);
+        push_thread_rows(rows, anchors, path, CommentSide::Right, Some(new_no), now, ViewMode::Split, wrap);
     }
 }
 
@@ -880,6 +926,7 @@ fn build_rows(
     upgrades: &HashMap<usize, FileUpgrade>,
     comments: Option<&CommentIndex>,
     show_comments: bool,
+    wrap: usize,
 ) -> (Vec<Row>, Vec<usize>, Vec<usize>) {
     let mut rows = Vec::new();
     let mut file_rows = Vec::new();
@@ -931,6 +978,7 @@ fn build_rows(
                     path,
                     anchors,
                     now,
+                    wrap,
                 );
             }
             let syntax_spans = match upgrade {
@@ -999,8 +1047,8 @@ fn build_rows(
                                 syntax,
                             },
                         });
-                        push_thread_rows(&mut rows, anchors, path, CommentSide::Left, old_no, now);
-                        push_thread_rows(&mut rows, anchors, path, CommentSide::Right, new_no, now);
+                        push_thread_rows(&mut rows, anchors, path, CommentSide::Left, old_no, now, ViewMode::Unified, wrap);
+                        push_thread_rows(&mut rows, anchors, path, CommentSide::Right, new_no, now, ViewMode::Unified, wrap);
                     }
                 }
                 ViewMode::Split => {
@@ -1042,6 +1090,7 @@ fn build_rows(
                                     CommentSide::Left,
                                     Some(*old_no),
                                     now,
+                                    ViewMode::Split, wrap,
                                 );
                                 push_thread_rows(
                                     &mut rows,
@@ -1050,6 +1099,7 @@ fn build_rows(
                                     CommentSide::Right,
                                     Some(*new_no),
                                     now,
+                                    ViewMode::Split, wrap,
                                 );
                                 i += 1;
                             }
@@ -1076,6 +1126,7 @@ fn build_rows(
                                     CommentSide::Right,
                                     Some(*new_no),
                                     now,
+                                    ViewMode::Split, wrap,
                                 );
                                 i += 1;
                             }
@@ -1130,6 +1181,7 @@ fn build_rows(
                                         CommentSide::Left,
                                         left_no,
                                         now,
+                                        ViewMode::Split, wrap,
                                     );
                                     push_thread_rows(
                                         &mut rows,
@@ -1138,6 +1190,7 @@ fn build_rows(
                                         CommentSide::Right,
                                         right_no,
                                         now,
+                                        ViewMode::Split, wrap,
                                     );
                                 }
                             }
@@ -1157,6 +1210,7 @@ fn build_rows(
                 path,
                 anchors,
                 now,
+                wrap,
             );
         }
     }
@@ -1274,27 +1328,88 @@ fn line_content(
 
 /// Shared shape of every comment row: indented card with a mantle background
 /// and a blue left accent, spanning full width in both view modes.
-fn comment_row(inner: gpui::AnyElement) -> gpui::AnyElement {
-    div()
-        .h(px(ROW_HEIGHT))
-        .w_full()
-        .flex()
-        .child(div().w(px(72.)).flex_shrink_0())
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
+/// Where a row sits in its thread's card, so the rows together draw one
+/// continuous outline instead of a box per row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CardEdge {
+    Top,
+    Middle,
+    Bottom,
+}
+
+fn comment_row(
+    inner: gpui::AnyElement,
+    half: Option<CommentSide>,
+    header: bool,
+    edge: CardEdge,
+) -> gpui::AnyElement {
+    // The card itself: indented past the gutter, blue-tinted and accented so a
+    // thread reads as one block distinct from the diff behind it. The author
+    // line gets a stronger wash so each comment's start is obvious.
+    let card = |inner: gpui::AnyElement| {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .child(div().w(px(72.)).flex_shrink_0())
+            .child({
+                // Sides on every row, caps only on the thread's first and last,
+                // so the rows stack into one unbroken outline.
+                let body = div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .bg(if header {
+                        theme::comment_header_bg()
+                    } else {
+                        theme::comment_bg()
+                    })
+                    .border_color(theme::comment_outline())
+                    .border_l_2()
+                    .border_r_1();
+                let body = match edge {
+                    CardEdge::Top => body.border_t_1().rounded_t_md(),
+                    CardEdge::Bottom => body.border_b_1().rounded_b_md(),
+                    CardEdge::Middle => body,
+                };
+                body.px_3()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(inner)
+            })
+    };
+    let row = div().h(px(ROW_HEIGHT)).w_full().flex();
+    match half {
+        // Unified: one column, so the card spans it.
+        None => row.child(card(inner)).into_any_element(),
+        // Split: sit in the half the comment was left on, mirroring the line
+        // rows' [cell | divider | cell] geometry so the divider stays aligned.
+        Some(side) => {
+            let empty = || div().flex_1().min_w_0().h_full();
+            let divider = div()
+                .w(px(SPLIT_DIVIDER))
+                .flex_shrink_0()
                 .h_full()
-                .bg(theme::mantle())
-                .border_l_2()
-                .border_color(theme::blue())
-                .px_3()
-                .flex()
-                .items_center()
-                .overflow_hidden()
-                .child(inner),
-        )
-        .into_any_element()
+                .bg(theme::crust())
+                .border_l_1()
+                .border_r_1()
+                .border_color(theme::surface0());
+            match side {
+                CommentSide::Left => row
+                    .child(card(inner))
+                    .child(divider)
+                    .child(empty())
+                    .into_any_element(),
+                CommentSide::Right => row
+                    .child(empty())
+                    .child(divider)
+                    .child(card(inner))
+                    .into_any_element(),
+            }
+        }
+    }
 }
 
 /// `selection` is this row's selected byte range (side + non-empty range),
@@ -1314,6 +1429,8 @@ fn render_row(
             author,
             when,
             is_reply,
+            half,
+            top,
         } => {
             let mut inner = div().flex().items_center().gap_2().min_w_0();
             if *is_reply {
@@ -1338,20 +1455,27 @@ fn render_row(
                             .child(when.clone()),
                     )
                     .into_any_element(),
+                *half,
+                true,
+                if *top { CardEdge::Top } else { CardEdge::Middle },
             )
         }
-        Row::CommentBody { line } => comment_row(
+        Row::CommentBody { line, half } => comment_row(
             div()
                 .whitespace_nowrap()
                 .text_color(theme::subtext())
                 .child(line.clone())
                 .into_any_element(),
+            *half,
+            false,
+            CardEdge::Middle,
         ),
         Row::CommentActions {
             root_id,
             path,
             side,
             line,
+            half,
         } => {
             let (root_id, side, line) = (*root_id, *side, *line);
             let path = path.clone();
@@ -1377,6 +1501,9 @@ fn render_row(
                         });
                     })
                     .into_any_element(),
+                *half,
+                false,
+                CardEdge::Bottom,
             )
         }
         Row::Spacer => div().h(row_height).into_any_element(),
@@ -2178,6 +2305,11 @@ struct ItemData {
     local_review: Option<LocalReview>,
     /// `c` toggles the comment rows; the file-header counts always show.
     comments_visible: bool,
+    /// Columns comment bodies are currently wrapped at, derived from the
+    /// measured pane width (see `comment_wrap_cols`). Changing it re-wraps the
+    /// bodies, which changes the row count, so render rebuilds the rows when
+    /// the pane resizes past a column boundary.
+    comment_wrap: usize,
     /// Users offered by the composer's `@`-mention autocomplete. Shared live
     /// with any open `MentionProvider`; seeded from PR participants, then
     /// filled from the repo's mentionable set (see `mentions_fetched`).
@@ -2244,6 +2376,7 @@ impl ItemData {
             &self.upgrades,
             self.comments.as_ref(),
             self.comments_visible,
+            self.comment_wrap,
         ));
         self.selection = None;
         self.cursor = nth_noncomment_row(&self.rows, cursor_base);
@@ -2383,6 +2516,7 @@ impl ReviewItem {
                         &data.upgrades,
                         data.comments.as_ref(),
                         data.comments_visible,
+                        data.comment_wrap,
                     );
                 }
                 if pr_meta.is_some() {
@@ -2425,6 +2559,7 @@ impl ReviewItem {
                     comments,
                     local_review,
                     comments_visible: true,
+                    comment_wrap: COMMENT_WRAP_CHARS,
                     mentions: Rc::new(RefCell::new(Vec::new())),
                     mentions_fetched: false,
                     tree: Vec::new(),
@@ -2503,7 +2638,7 @@ fn fetch_item(source: &Source, mode: ViewMode) -> anyhow::Result<Loaded> {
     };
     let diff = diff_core::parse_patch(&patch);
     let (rows, file_rows, hunk_rows) =
-        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true);
+        build_rows(&diff, mode, &HashMap::new(), comments.as_ref(), true, COMMENT_WRAP_CHARS);
     Ok(Loaded {
         meta,
         diff,
@@ -4115,6 +4250,36 @@ impl ReviewApp {
         cx.notify();
     }
 
+    /// Re-wrap comment bodies to the pane's current width. Called each render:
+    /// the bounds come from the last paint, so a resize (or toggling the
+    /// sidebar, chat, or view mode) settles on the following frame. Rebuilding
+    /// only when the column count actually changes keeps this off the hot path
+    /// — a few pixels of drag usually map to the same width in columns.
+    fn resync_comment_wrap(&mut self, window: &Window) {
+        let char_width = f32::from(self.char_width(window));
+        let Some(data) = self.active_data_mut() else {
+            return;
+        };
+        // Nothing to re-wrap without visible threads.
+        let has_threads = data.comments_visible
+            && data
+                .comments
+                .as_ref()
+                .is_some_and(|index| !index.threads.is_empty());
+        let list_width = f32::from(data.scroll.0.borrow().base_handle.bounds().size.width);
+        if list_width <= 0. {
+            return; // Not painted yet; keep the default until it is.
+        }
+        let wrap = comment_wrap_cols(list_width, data.mode, char_width);
+        if wrap == data.comment_wrap {
+            return;
+        }
+        data.comment_wrap = wrap;
+        if has_threads {
+            data.rebuild_rows_anchored();
+        }
+    }
+
     fn active_item(&self) -> Option<&ReviewItem> {
         self.items.get(self.active)
     }
@@ -4347,6 +4512,7 @@ impl ReviewApp {
                     &data.upgrades,
                     data.comments.as_ref(),
                     data.comments_visible,
+                    data.comment_wrap,
                 ));
                 data.cursor = data.cursor.min(data.rows.len().saturating_sub(1));
                 data.selection = None;
@@ -4501,6 +4667,7 @@ impl ReviewApp {
             &data.upgrades,
             data.comments.as_ref(),
             data.comments_visible,
+            data.comment_wrap,
         ));
         // The gap row is replaced by its hidden context rows (plus any
         // comment threads anchored inside them): the row-count delta is
@@ -5009,6 +5176,7 @@ impl ReviewApp {
             &data.upgrades,
             data.comments.as_ref(),
             data.comments_visible,
+            data.comment_wrap,
         ));
         let target = file_pos
             .and_then(|pos| data.file_rows.get(pos).copied())
@@ -7825,6 +7993,7 @@ impl ReviewApp {
 impl Render for ReviewApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
+        self.resync_comment_wrap(window);
         let pane: gpui::AnyElement = match self.active_item() {
             None => centered_message("⌘T to open a PR or path".into(), theme::overlay0()),
             Some(item) => match &item.state {
@@ -8374,7 +8543,7 @@ mod tests {
 
     #[test]
     fn split_context_fills_both_cells() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         // rows[0] = FileHeader, rows[1] = HunkHeader, rows[2] = first context.
         match &rows[2] {
             Row::SplitLine { left, right } => {
@@ -8387,7 +8556,7 @@ mod tests {
 
     #[test]
     fn split_pairs_equal_runs_positionally() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         match &rows[3] {
             Row::SplitLine { left, right } => {
                 assert_eq!(cell(left), (2, LineKind::Removed, "old1", &[0..3][..]));
@@ -8415,7 +8584,7 @@ mod tests {
     #[test]
     fn split_unequal_and_lone_runs_are_one_sided() {
         let (rows, _, hunk_rows) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         let h2 = hunk_rows[1];
         // 2 removed / 1 added: first row paired, second left-only.
         match &rows[h2 + 1] {
@@ -8506,7 +8675,7 @@ mod tests {
     fn upgraded_file_gets_gap_rows_and_marked_headers() {
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true);
+            let (rows, _, hunk_rows) = build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
             // FileHeader, Gap(6), HunkHeader, 7 hunk rows, Gap(7).
             match &rows[1] {
                 Row::Gap {
@@ -8529,7 +8698,7 @@ mod tests {
             assert!(row_side_text(&rows[1], SelSide::Left).is_none());
         }
         // Un-upgraded build of the same diff has no gap rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         assert!(matches!(
             rows[1],
@@ -8545,7 +8714,7 @@ mod tests {
         let (diff, mut upgrades) = upgraded_diff();
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
 
-        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
+        let (rows, _, hunk_rows) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
         // Leading gap expanded into 6 context rows before the hunk header.
         assert_eq!(hunk_rows, vec![7]); // FileHeader + 6 context rows
         for (j, row) in rows[1..7].iter().enumerate() {
@@ -8569,7 +8738,7 @@ mod tests {
         assert!(matches!(rows.last(), Some(Row::Gap { gap_ix: 1, .. })));
 
         // Split mode: same expansion as two-cell context rows.
-        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades, None, true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Split, &upgrades, None, true, COMMENT_WRAP_CHARS);
         match &rows[1] {
             Row::SplitLine { left, right } => {
                 let (l, r) = (left.as_ref().unwrap(), right.as_ref().unwrap());
@@ -8583,7 +8752,7 @@ mod tests {
 
         // Expanding the trailing gap too: numbering continues past the hunk.
         upgrades.get_mut(&0).unwrap().expanded.insert(1);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, None, true, COMMENT_WRAP_CHARS);
         assert!(!rows.iter().any(|row| matches!(row, Row::Gap { .. })));
         match rows.last().unwrap() {
             Row::Line {
@@ -8912,7 +9081,7 @@ mod tests {
     fn header_indices_are_correct_in_both_modes() {
         let diff = sample_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), None, true);
+            let (rows, file_rows, hunk_rows) = build_rows(&diff, mode, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
             assert_eq!(file_rows.len(), 2);
             assert_eq!(hunk_rows.len(), 2);
             for &ix in &file_rows {
@@ -8925,8 +9094,8 @@ mod tests {
             assert!(matches!(rows[file_rows[1] + 1], Row::Binary));
         }
         // Unified emits one row per diff row; split collapses the equal run.
-        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true);
-        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true);
+        let (unified, _, _) = build_rows(&diff, ViewMode::Unified, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
+        let (split, _, _) = build_rows(&diff, ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         let unified_lines = unified
             .iter()
             .filter(|r| matches!(r, Row::Line { .. }))
@@ -9117,6 +9286,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+                COMMENT_WRAP_CHARS,
         );
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
@@ -9134,7 +9304,7 @@ mod tests {
 
     #[test]
     fn minimap_rows_split_pairs_and_gaps() {
-        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+        let (rows, _, _) = build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         let mm = minimap_rows(&rows);
         assert_eq!(mm.len(), rows.len());
         // Context pair: both halves, no change flags.
@@ -9182,7 +9352,7 @@ mod tests {
         // Gap rows map to Gap in both modes.
         let (diff, upgrades) = upgraded_diff();
         for mode in [ViewMode::Unified, ViewMode::Split] {
-            let (rows, _, _) = build_rows(&diff, mode, &upgrades, None, true);
+            let (rows, _, _) = build_rows(&diff, mode, &upgrades, None, true, COMMENT_WRAP_CHARS);
             let mm = minimap_rows(&rows);
             assert_eq!(mm[1], mrow(MinimapKind::Gap, 1.));
         }
@@ -9579,6 +9749,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
+                COMMENT_WRAP_CHARS,
         );
         // rows: FileHeader, HunkHeader, ctx, rem old1 (old_no 2) + LEFT
         // thread, rem old2, add new1 (new_no 2) + RIGHT thread, …
@@ -9628,6 +9799,7 @@ mod tests {
                 path,
                 side,
                 line,
+                ..
             } => {
                 assert_eq!(*root_id, 1);
                 assert_eq!(path.as_ref(), "a.rs");
@@ -9658,6 +9830,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
+                COMMENT_WRAP_CHARS,
         );
         // rows[3] pairs old1/new1 (both line 2): LEFT thread then RIGHT
         // thread directly beneath it.
@@ -9680,6 +9853,160 @@ mod tests {
         assert_eq!(names[12], "SplitLine"); // old2 | new2
     }
 
+    /// The half a comment row renders in, or None for a full-width card.
+    fn row_half(row: &Row) -> Option<Option<CommentSide>> {
+        match row {
+            Row::CommentHeader { half, .. }
+            | Row::CommentBody { half, .. }
+            | Row::CommentActions { half, .. } => Some(*half),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn split_comments_render_in_the_half_they_were_left_on() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Split,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // rows[4..7] are carol's LEFT thread, rows[7..12] the RIGHT one; each
+        // row of a thread carries the side it was anchored to.
+        let halves: Vec<Option<Option<CommentSide>>> =
+            rows[4..12].iter().map(row_half).collect();
+        assert_eq!(
+            halves,
+            vec![
+                Some(Some(CommentSide::Left)),  // carol header
+                Some(Some(CommentSide::Left)),  // body
+                Some(Some(CommentSide::Left)),  // actions
+                Some(Some(CommentSide::Right)), // alice header
+                Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // bob reply header
+                Some(Some(CommentSide::Right)), // body
+                Some(Some(CommentSide::Right)), // actions
+            ]
+        );
+    }
+
+    #[test]
+    fn only_a_threads_first_row_draws_the_card_top() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+            COMMENT_WRAP_CHARS,
+        );
+        // Exactly one top edge per thread, and it's the root's header — a
+        // reply's header sits mid-card and must not cap it.
+        let mut tops = 0;
+        let mut threads = 0;
+        for row in &rows {
+            match row {
+                Row::CommentHeader { top, is_reply, .. } => {
+                    if *top {
+                        tops += 1;
+                        assert!(!is_reply, "a reply header must not open the card");
+                    }
+                }
+                // The actions row always closes a thread, so it counts them.
+                Row::CommentActions { .. } => threads += 1,
+                _ => {}
+            }
+        }
+        assert!(threads > 0, "fixture should have threads");
+        assert_eq!(tops, threads, "one top edge per thread");
+    }
+
+    #[test]
+    fn comment_wrap_cols_follows_the_pane_width() {
+        let cw = 8.0; // 8px per column keeps the arithmetic obvious.
+        let chrome = COMMENT_CARD_CHROME;
+        // Unified uses the whole width; split only its half, so the same pane
+        // yields roughly half the columns.
+        assert_eq!(comment_wrap_cols(chrome + 40. * cw, ViewMode::Unified, cw), 40);
+        let split_pane = 2. * (chrome + 40. * cw) + SPLIT_DIVIDER;
+        assert_eq!(comment_wrap_cols(split_pane, ViewMode::Split, cw), 40);
+        // A roomy pane stops widening at the readability cap...
+        assert_eq!(
+            comment_wrap_cols(10_000., ViewMode::Unified, cw),
+            COMMENT_WRAP_CHARS
+        );
+        // ...and a cramped one bottoms out rather than wrapping every word.
+        assert_eq!(
+            comment_wrap_cols(0., ViewMode::Split, cw),
+            MIN_COMMENT_WRAP_CHARS
+        );
+        // Degenerate char width can't divide by zero.
+        assert_eq!(
+            comment_wrap_cols(800., ViewMode::Unified, 0.),
+            COMMENT_WRAP_CHARS
+        );
+    }
+
+    #[test]
+    fn comment_bodies_wrap_to_the_requested_column_width() {
+        // One long prose line plus an unbreakable token (a URL), the two ways a
+        // body runs past the card.
+        let body = format!("{} https://example.com/{}", "word ".repeat(60), "x".repeat(200));
+        let index = group_comments(vec![rc(
+            1,
+            "a.rs",
+            Some("RIGHT"),
+            Some(2),
+            &body,
+            "alice",
+            "2026-01-01T00:00:00Z",
+            None,
+        )]);
+        for (name, mode, cap) in [
+            ("unified", ViewMode::Unified, COMMENT_WRAP_CHARS),
+            ("split", ViewMode::Split, 40),
+        ] {
+            let (rows, _, _) =
+                build_rows(&sample_diff(), mode, &HashMap::new(), Some(&index), true, cap);
+            let bodies: Vec<&SharedString> = rows
+                .iter()
+                .filter_map(|row| match row {
+                    Row::CommentBody { line, .. } => Some(line),
+                    _ => None,
+                })
+                .collect();
+            assert!(!bodies.is_empty(), "{name} should have body rows");
+            for line in bodies {
+                assert!(
+                    line.chars().count() <= cap,
+                    "{name}: {:?} exceeds {cap} cols",
+                    line.as_ref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unified_comments_span_the_full_width() {
+        let index = sample_comments();
+        let (rows, _, _) = build_rows(
+            &sample_diff(),
+            ViewMode::Unified,
+            &HashMap::new(),
+            Some(&index),
+            true,
+                COMMENT_WRAP_CHARS,
+        );
+        // Unified has one column, so no comment row is confined to a half.
+        assert!(rows.iter().filter_map(row_half).all(|half| half.is_none()));
+        // ...and the diff really does contain comment rows to check.
+        assert!(rows.iter().any(is_comment_row));
+    }
+
     #[test]
     fn hidden_comments_keep_header_counts() {
         let index = sample_comments();
@@ -9689,6 +10016,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             false,
+                COMMENT_WRAP_CHARS,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -9706,6 +10034,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+                COMMENT_WRAP_CHARS,
         );
         assert!(!rows.iter().any(is_comment_row));
         match &rows[0] {
@@ -9732,11 +10061,11 @@ mod tests {
             "2026-01-01T00:00:00Z",
             None,
         )]);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
         // Collapsed gap: the thread has no anchor row and stays hidden.
         assert!(!rows.iter().any(is_comment_row));
         upgrades.get_mut(&0).unwrap().expanded.insert(0);
-        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true);
+        let (rows, _, _) = build_rows(&diff, ViewMode::Unified, &upgrades, Some(&index), true, COMMENT_WRAP_CHARS);
         // FileHeader, ctx 1, ctx 2, ctx 3, then the thread.
         assert_eq!(row_name(&rows[3]), "Line");
         assert_eq!(row_name(&rows[4]), "CommentHeader");
@@ -9753,6 +10082,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
+                COMMENT_WRAP_CHARS,
         );
         // Headers and comment rows anchor nothing.
         assert_eq!(comment_anchor(&rows, 0, SelSide::Unified), None);
@@ -9772,7 +10102,7 @@ mod tests {
         );
         // Split: the half under the pointer decides; absent cells refuse.
         let (rows, _, hunk_rows) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         assert_eq!(
             comment_anchor(&rows, 3, SelSide::Left),
             Some((CommentSide::Left, 2))
@@ -9799,6 +10129,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+                COMMENT_WRAP_CHARS,
         );
         let (with, _, _) = build_rows(
             &sample_diff(),
@@ -9806,6 +10137,7 @@ mod tests {
             &HashMap::new(),
             Some(&index),
             true,
+                COMMENT_WRAP_CHARS,
         );
         // Every plain row maps to the same row content with comments shown.
         for (n, row) in plain.iter().enumerate() {
@@ -9969,6 +10301,7 @@ mod tests {
             &HashMap::new(),
             None,
             true,
+                COMMENT_WRAP_CHARS,
         );
         // rows: FileHeader, HunkHeader, ctx(1,1 "ctx"), rem(2 "old1"),
         // rem(3 "old2"), add(2 "new1"), …
@@ -9984,7 +10317,7 @@ mod tests {
 
         // Split selection locked to the right side.
         let (rows, file_rows, _) =
-            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true);
+            build_rows(&sample_diff(), ViewMode::Split, &HashMap::new(), None, true, COMMENT_WRAP_CHARS);
         let right = sel(SelSide::Right, (3, 0), (4, 4));
         let info = selection_info(&right, &rows, &file_rows, &sample_diff()).unwrap();
         assert_eq!(info.side, "RIGHT (new)");

@@ -152,6 +152,21 @@ pub fn selection_bg() -> Rgba {
     rgba(0x89b4fa4d)
 }
 
+/// Review comment card: a blue tint that lifts the thread off the diff without
+/// hiding it, with a stronger wash behind each comment's author line.
+pub fn comment_bg() -> Rgba {
+    rgba(0x89b4fa14)
+}
+pub fn comment_header_bg() -> Rgba {
+    rgba(0x89b4fa2b)
+}
+
+/// Outline drawn around a whole thread: sky at partial alpha, so it reads as a
+/// soft neon edge against the dark pane without competing with the diff.
+pub fn comment_outline() -> Rgba {
+    rgba(0x89dceb8c)
+}
+
 /// Low-alpha tints: syntax/text must stay readable on top. Never opaque.
 pub fn added_row_bg() -> Rgba {
     rgba(0xa6e3a120)
